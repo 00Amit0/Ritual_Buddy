@@ -1,0 +1,23 @@
+# Virtual env
+venv/
+env/
+bookerenv/
+bookingenv/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables
+.env
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
