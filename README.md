@@ -1,4 +1,4 @@
-# 🕉️ Pandit Booking Platform — FastAPI Backend
+# 🕉️ Ritual Buddy — FastAPI Backend
 
 A production-ready, microservices-based FastAPI backend for the Pandit Booking Platform.
 
