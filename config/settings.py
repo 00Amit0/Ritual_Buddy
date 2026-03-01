@@ -42,9 +42,9 @@ class Settings(BaseSettings):
     REDIS_SLOT_LOCK_TTL: int = 900      # 15 minutes
 
     # ── OAuth2 - Google ──────────────────────────────────────
-    GOOGLE_CLIENT_ID: str
-    GOOGLE_CLIENT_SECRET: str
-    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
+    GOOGLE_CLIENT_ID: str 
+    GOOGLE_CLIENT_SECRET: str 
+    GOOGLE_REDIRECT_URI: str = "http://localhost/auth/google/callback"
 
     # ── JWT ──────────────────────────────────────────────────
     JWT_SECRET_KEY: str

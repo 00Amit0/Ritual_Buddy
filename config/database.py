@@ -6,7 +6,7 @@ Uses asyncpg driver for PostgreSQL with PostGIS support.
 
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
-
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -81,16 +81,25 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
             await session.close()
 
 
+# async def init_db() -> None:
+#     """Create all tables. Run during app startup."""
+#     async with engine.begin() as conn:
+#         # Enable PostGIS and uuid-ossp extensions
+#         await conn.execute(
+#             __import__("sqlalchemy").text(
+#                 "CREATE EXTENSION IF NOT EXISTS postgis;"
+#                 "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
+#             )
+#         )
+#         await conn.run_sync(Base.metadata.create_all)
 async def init_db() -> None:
     """Create all tables. Run during app startup."""
     async with engine.begin() as conn:
-        # Enable PostGIS and uuid-ossp extensions
-        await conn.execute(
-            __import__("sqlalchemy").text(
-                "CREATE EXTENSION IF NOT EXISTS postgis;"
-                "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
-            )
-        )
+
+        # Enable extensions separately (asyncpg requires single statements)
+        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+
         await conn.run_sync(Base.metadata.create_all)
 
 

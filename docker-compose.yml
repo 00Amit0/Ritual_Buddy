@@ -1,19 +1,43 @@
 version: "3.9"
 
 services:
-  # ── Application ──────────────────────────────────────────────
-  api:
+  # ── NGINX Load Balancer / Reverse Proxy ──────────────────────
+  # Acts as single entry point, distributes traffic across API instances,
+  # handles rate limiting, caching, circuit breaking
+  nginx:
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    ports:
+      - "80:80"
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+      api3:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Application - Instance 1 ────────────────────────────────
+  api1:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
     env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       ELASTICSEARCH_URL: http://elasticsearch:9200
+      INSTANCE_NAME: "api1"
     depends_on:
       postgres:
         condition: service_healthy
@@ -23,8 +47,95 @@ services:
         condition: service_healthy
     volumes:
       - .:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Application - Instance 2 ────────────────────────────────
+  api2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      INSTANCE_NAME: "api2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Application - Instance 3 ────────────────────────────────
+  api3:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      INSTANCE_NAME: "api3"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── PostgreSQL + PostGIS ──────────────────────────────────────
   postgres:
@@ -43,6 +154,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Redis ─────────────────────────────────────────────────────
   redis:
@@ -57,6 +176,14 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Elasticsearch ─────────────────────────────────────────────
   elasticsearch:
@@ -74,7 +201,14 @@ services:
       interval: 10s
       timeout: 10s
       retries: 10
-
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
   # ── Kibana (Elasticsearch UI) ─────────────────────────────────
   kibana:
     image: kibana:8.12.1
@@ -87,6 +221,14 @@ services:
         condition: service_healthy
     profiles:
       - dev-tools  # Only start with: docker-compose --profile dev-tools up
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Celery Worker ─────────────────────────────────────────────
   celery-worker:
@@ -103,6 +245,13 @@ services:
       - redis
       - postgres
     restart: unless-stopped
+    networks:
+      - pandit_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ── Flower (Celery monitoring) ────────────────────────────────
   flower:
@@ -119,12 +268,21 @@ services:
       - redis
     profiles:
       - dev-tools
+    networks:
+      - pandit_network
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   postgres_data:
   redis_data:
   es_data:
 
+# Explicit network so compose doesn't complain
 networks:
-  default:
-    name: pandit_network
+  pandit_network:
+    driver: bridge

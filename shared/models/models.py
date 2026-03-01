@@ -150,7 +150,7 @@ class User(TimestampMixin, SoftDeleteMixin, Base):
 
     # Relationships
     pandit_profile: Mapped[Optional["PanditProfile"]] = relationship(
-        back_populates="user", uselist=False, lazy="select"
+        back_populates="user", uselist=False, lazy="select", foreign_keys="PanditProfile.user_id"
     )
     bookings: Mapped[List["Booking"]] = relationship(
         back_populates="user", foreign_keys="Booking.user_id"
@@ -301,12 +301,32 @@ class PanditProfile(TimestampMixin, Base):
     profile_complete: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # Relationships
-    user: Mapped["User"] = relationship(back_populates="pandit_profile")
+    # user: Mapped["User"] = relationship(back_populates="pandit_profile")
+    # availability_slots: Mapped[List["PanditAvailability"]] = relationship(
+    #     back_populates="pandit"
+    # )
+    # bookings: Mapped[List["Booking"]] = relationship(
+    #     back_populates="pandit", foreign_keys="Booking.pandit_id"
+    # )
+    # Relationships
+    user: Mapped["User"] = relationship(
+        "User",
+        back_populates="pandit_profile",
+        foreign_keys=[user_id]
+    )
+
+    verified_by: Mapped[Optional["User"]] = relationship(
+        "User",
+        foreign_keys=[verified_by_id]
+    )
+
     availability_slots: Mapped[List["PanditAvailability"]] = relationship(
         back_populates="pandit"
     )
+
     bookings: Mapped[List["Booking"]] = relationship(
-        back_populates="pandit", foreign_keys="Booking.pandit_id"
+        back_populates="pandit",
+        foreign_keys="Booking.pandit_id"
     )
 
     __table_args__ = (
@@ -437,7 +457,7 @@ class BookingAuditLog(Base):
         UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
     )
     reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    audit_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
