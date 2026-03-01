@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # ── OAuth2 - Google ──────────────────────────────────────
     GOOGLE_CLIENT_ID: str 
     GOOGLE_CLIENT_SECRET: str 
-    GOOGLE_REDIRECT_URI: str = "http://localhost/auth/google/callback"
+    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
 
     # ── JWT ──────────────────────────────────────────────────
     JWT_SECRET_KEY: str

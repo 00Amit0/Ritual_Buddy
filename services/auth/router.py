@@ -140,9 +140,6 @@ async def google_login(request: Request):
     The client should open this URL in a browser/webview.
     """
     redirect_uri = settings.GOOGLE_REDIRECT_URI
-    token = await oauth.google.authorize_redirect(request, redirect_uri)
-    print(redirect_uri)
-    print("TOKEN----", token)
     return await oauth.google.authorize_redirect(request, redirect_uri)
 
 
@@ -167,7 +164,6 @@ async def google_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"OAuth error: {e.error}",
         )
-    print("------", token)
     userinfo = token.get("userinfo")
     if not userinfo:
         raise HTTPException(
