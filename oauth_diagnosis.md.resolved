@@ -1,0 +1,126 @@
+# OAuth Issues Diagnosis — Docker + Nginx Setup
+
+After reviewing: [nginx.conf](file:///d:/Plutobyte_Projects/Ritual_Buddy/nginx.conf), [docker-compose.yml](file:///d:/Plutobyte_Projects/Ritual_Buddy/docker-compose.yml), [Dockerfile](file:///d:/Plutobyte_Projects/Ritual_Buddy/Dockerfile), [Dockerfile.nginx](file:///d:/Plutobyte_Projects/Ritual_Buddy/Dockerfile.nginx), [main.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/main.py), [settings.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/config/settings.py), [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env), and [services/auth/router.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/services/auth/router.py), here are the issues found:
+
+---
+
+## 🔴 Issue 1: Redirect URI Mismatch (port 80 vs 8000)
+
+This is the core issue. Your Docker setup exposes **port 80** via nginx, but your OAuth config points to port **8000**.
+
+| File | Current Value | Should Be |
+|---|---|---|
+| [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) → `GOOGLE_REDIRECT_URI` | `http://localhost:8000/auth/google/callback` | `http://localhost/auth/google/callback` |
+| Google Cloud Console → Redirect URI | `http://localhost/auth/google/callback` ✅ | Already correct |
+| [settings.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/config/settings.py) → default | `http://localhost:8000/auth/google/callback` | `http://localhost/auth/google/callback` |
+
+**Why:** When running in Docker, nginx listens on port 80 and proxies to the internal FastAPI instances on port 8000. The browser only sees port 80. Google redirects the user to the redirect URI, so it **must** match the port the **browser** is using (80), not the internal container port (8000).
+
+```diff
+# .env
+-GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
++GOOGLE_REDIRECT_URI=http://localhost/auth/google/callback
+```
+
+---
+
+## 🔴 Issue 2: OAuth Session State Breaks Across Multiple API Instances
+
+This is a **critical** issue. The OAuth flow uses a 2-step process:
+
+1. `GET /auth/google` — stores a `state` + `code_verifier` in the **server-side session**
+2. `GET /auth/google/callback` — reads back the `state` to verify the response
+
+Your `SessionMiddleware` uses **cookie-based sessions** (which is fine), BUT the `secret_key` must be the same across all instances — which it is (from `settings.SECRET_KEY`). **This part is OK.**
+
+However, your `SessionMiddleware` config is:
+
+```python
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.SECRET_KEY,
+    session_cookie="pandit_session",
+    same_site="lax",
+    https_only=settings.is_production,
+)
+```
+
+The session cookie `pandit_session` must be readable by the callback endpoint. Since nginx uses `least_conn` load balancing across `api1`, `api2`, `api3`, the **login request** might hit `api1` but the **callback** might hit `api2`. Because Starlette's `SessionMiddleware` stores data **in the cookie itself** (signed, not server-side), this actually works — the data travels with the cookie. ✅
+
+**BUT** there's a subtle issue: the session cookie's `path` defaults to `/`, which is fine. However, if the browser doesn't send the cookie on the callback URL for any reason (e.g., cross-site cookie policies), the OAuth state verification will fail with a cryptic error.
+
+> [!IMPORTANT]  
+> Make sure your browser isn't blocking third-party cookies when testing. The `same_site="lax"` setting should work for top-level navigations (which OAuth redirects are), but check DevTools → Application → Cookies to confirm `pandit_session` is present during the callback.
+
+---
+
+## 🟡 Issue 3: Nginx Not Forwarding the Host Header Correctly for OAuth
+
+In [nginx.conf](file:///d:/Plutobyte_Projects/Ritual_Buddy/nginx.conf), your auth location block sets:
+
+```nginx
+proxy_set_header Host $http_host;
+```
+
+This is correct — it preserves the original `Host` header including the port. ✅
+
+However, authlib (used in [router.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/services/auth/router.py)) constructs the redirect URI from the [request](file:///d:/Plutobyte_Projects/Ritual_Buddy/main.py#191-199) object. When running behind a proxy, it needs `X-Forwarded-Proto` and `X-Forwarded-Host` to build the correct URL. Your nginx config does set these:
+
+```nginx
+proxy_set_header X-Forwarded-Proto $scheme;
+proxy_set_header X-Forwarded-Host $host;
+```
+
+And your uvicorn command includes `--proxy-headers --forwarded-allow-ips="*"`, which tells uvicorn to trust these headers. ✅
+
+**BUT** there's a conflict: your [router.py](file:///d:/Plutobyte_Projects/Ritual_Buddy/services/auth/router.py) **hardcodes** the redirect URI in the [google_login](file:///d:/Plutobyte_Projects/Ritual_Buddy/services/auth/router.py#136-144) endpoint:
+
+```python
+redirect_uri = settings.GOOGLE_REDIRECT_URI  # hardcoded
+return await oauth.google.authorize_redirect(request, redirect_uri)
+```
+
+And also in the OAuth registration:
+
+```python
+oauth.register(
+    ...
+    redirect_uri=settings.GOOGLE_REDIRECT_URI,  # hardcoded here too
+)
+```
+
+This means the redirect URI is set **twice** — once in `oauth.register()` and once in `authorize_redirect()`. The value from `settings.GOOGLE_REDIRECT_URI` is used both times, so it's fine as long as [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) has the correct value.
+
+---
+
+## 🟡 Issue 4: `FRONTEND_URL` and `ALLOWED_ORIGINS` Don't Include Port 80
+
+Currently in [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env):
+
+```
+FRONTEND_URL=http://localhost:3000
+ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
+```
+
+If your frontend is also being served through Docker/nginx, or if you're testing the OAuth callback directly in the browser at `http://localhost`, you should add `http://localhost` to `ALLOWED_ORIGINS`:
+
+```diff
+-ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
++ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001,http://localhost
+```
+
+---
+
+## Summary: What to Fix
+
+| Priority | Fix | File |
+|---|---|---|
+| 🔴 Must | Change `GOOGLE_REDIRECT_URI` to `http://localhost/auth/google/callback` | [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) |
+| 🔴 Must | Change the same redirect URI in Google Cloud Console | Google Console |
+| 🟡 Should | Add `http://localhost` to `ALLOWED_ORIGINS` | [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) |
+| ✅ Verify | Confirm `pandit_session` cookie is sent during callback | Browser DevTools |
+
+> [!NOTE]  
+> If you're testing **without Docker** (running FastAPI directly with `uvicorn`), you'd need port 8000 in the redirect URI. Consider using different [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) files for local vs Docker:
+> - [.env](file:///d:/Plutobyte_Projects/Ritual_Buddy/.env) — for Docker (port 80)
+> - `.env.local` — for direct local dev (port 8000)

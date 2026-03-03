@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     # ── OAuth2 - Google ──────────────────────────────────────
     GOOGLE_CLIENT_ID: str 
     GOOGLE_CLIENT_SECRET: str 
-    GOOGLE_REDIRECT_URI: str = "http://localhost:8000/auth/google/callback"
+    GOOGLE_REDIRECT_URI: str = "http://localhost/auth/google/callback"
 
     # ── JWT ──────────────────────────────────────────────────
     JWT_SECRET_KEY: str
@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     # ── Frontend ─────────────────────────────────────────────
     FRONTEND_URL: str = "http://localhost:3000"
     ADMIN_FRONTEND_URL: str = "http://localhost:3001"
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001"
+    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:3001,http://localhost"
 
     # ── AWS / R2 Storage ─────────────────────────────────────
     S3_ACCESS_KEY_ID: str = ""

@@ -16,6 +16,7 @@ import time
 import uuid
 import os
 from contextlib import asynccontextmanager
+from sqlalchemy import select
 
 from fastapi import FastAPI, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -374,11 +375,15 @@ async def seed_initial_data():
             {"name_en": "Saraswati Puja", "name_hi": "सरस्वती पूजा", "slug": "saraswati-puja", "category": PoojaCategory.EDUCATION, "avg_duration_hrs": 1.5},
         ]
 
-        for p in seed_poojas:
-            db.add(Pooja(**p))
-
-        await db.commit()
-        print(f"✅ Seeded {len(seed_poojas)} pooja types")
+        # Check if already seeded
+        existing = await db.execute(select(Pooja).limit(1))
+        if not existing.scalar():
+            for p in seed_poojas:
+                db.add(Pooja(**p))
+            await db.commit()
+            print(f"✅ Seeded {len(seed_poojas)} pooja types")
+        else:
+            print("ℹ️ Poojas already seeded, skipping")
 
 
 # ── Entry Point ───────────────────────────────────────────────
