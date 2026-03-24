@@ -1,4 +1,4 @@
-.PHONY: help install test run docker-up docker-down clean lint format db-migrate db-downgrade
+.PHONY: help install test run docker-up docker-down clean lint format db-revision db-upgrade db-downgrade db-current db-history db-stamp db-bootstrap
 
 help: ## Show this help message
 	@echo "Pandit Booking Platform — Development Commands"
@@ -38,23 +38,20 @@ docker-build: ## Build Docker image
 	docker build -t pandit-booking:latest .
 
 docker-up: ## Start all services with Docker Compose
-	docker-compose up -d
+	docker compose up -d
 	@echo "✅ Services started. API: http://localhost:8000"
 
 docker-down: ## Stop all Docker services
-	docker-compose down
+	docker compose down
 
 docker-logs: ## View Docker service logs
-	docker-compose logs -f api
+	docker compose logs -f api1 api2 api3 nginx
 
 docker-clean: ## Remove Docker containers and volumes
-	docker-compose down -v
+	docker compose down -v
 	@echo "✅ Docker cleanup complete"
 
-db-init: ## Initialize database (create tables)
-	docker-compose exec api python -c "from config.database import init_db; import asyncio; asyncio.run(init_db())"
-
-db-migrate: ## Create new Alembic migration
+db-revision: ## Create new Alembic migration (usage: make db-revision msg="add_x")
 	alembic revision --autogenerate -m "$(msg)"
 
 db-upgrade: ## Apply pending migrations
@@ -63,14 +60,26 @@ db-upgrade: ## Apply pending migrations
 db-downgrade: ## Rollback last migration
 	alembic downgrade -1
 
+db-current: ## Show current migration revision
+	alembic current
+
+db-history: ## Show migration history
+	alembic history
+
+db-stamp: ## Mark DB at current head without running migrations
+	alembic stamp head
+
+db-bootstrap: ## One-time: adopt Alembic for an existing schema (no DDL)
+	alembic stamp head
+
 db-reset: ## Reset database (⚠️ deletes all data)
-	docker-compose exec postgres dropdb pandit_db -U postgres
-	docker-compose exec postgres createdb pandit_db -U postgres
+	docker compose exec postgres dropdb pandit_db -U postgres
+	docker compose exec postgres createdb pandit_db -U postgres
 	alembic upgrade head
 	@echo "✅ Database reset complete"
 
 redis-cli: ## Connect to Redis CLI
-	docker-compose exec redis redis-cli
+	docker compose exec redis redis-cli
 
 es-health: ## Check Elasticsearch health
 	curl http://localhost:9200/_cluster/health | jq .
@@ -102,7 +111,7 @@ freeze: ## Export current dependencies
 	pip freeze > requirements.lock
 
 # Development workflow
-setup: install docker-up db-migrate seed-data ## Complete setup for development
+setup: install docker-up db-upgrade seed-data ## Complete setup for development
 	@echo "✅ Development environment ready!"
 	@echo "   API: http://localhost:8000/docs"
 	@echo "   Elasticsearch: http://localhost:9200"

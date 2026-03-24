@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, select, update
 from sqlalchemy.orm import sessionmaker
 
 from config.settings import settings
+from shared.events.outbox import enqueue_event_sync
 from tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -52,7 +53,7 @@ def process_single_payout(self, payment_id: str):
 
     Idempotent: skips if payout_id already set.
     """
-    from shared.models.models import Booking, BookingStatus, PanditProfile, Payment, PaymentStatus, User
+    from shared.models.models import Booking, BookingStatus, PanditProfile, Payment, PaymentStatus
 
     db = _get_sync_session()
     try:
@@ -126,6 +127,21 @@ def process_single_payout(self, payment_id: str):
         payment.payout_amount = payment.pandit_payout
         payment.payout_at = datetime.now(timezone.utc)
         payment.status = PaymentStatus.CAPTURED  # stays CAPTURED; payout is separate tracking
+        enqueue_event_sync(
+            db,
+            topic="payment-events",
+            event_type="payment.payout_processed",
+            event_key=str(payment.id),
+            payload={
+                "payment_id": str(payment.id),
+                "booking_id": str(booking.id),
+                "booking_number": booking.booking_number,
+                "pandit_id": str(booking.pandit_id),
+                "pandit_user_id": str(pandit_profile.user_id),
+                "amount": float(payment.pandit_payout or 0),
+                "payout_id": payment.payout_id,
+            },
+        )
 
         db.commit()
         logger.info(f"Payout {payment.payout_id} processed for booking {booking.booking_number}")
@@ -192,7 +208,7 @@ def process_refund(self, payment_id: str, amount: float | None = None, reason: s
 
     Idempotent: checks for existing refund_id before re-attempting.
     """
-    from shared.models.models import Payment, PaymentStatus
+    from shared.models.models import Payment, PaymentBookingProjection, PaymentStatus
 
     db = _get_sync_session()
     try:
@@ -235,6 +251,26 @@ def process_refund(self, payment_id: str, amount: float | None = None, reason: s
             payment.status = PaymentStatus.REFUNDED
         else:
             payment.status = PaymentStatus.PARTIALLY_REFUNDED
+
+        projection = db.execute(
+            select(PaymentBookingProjection).where(PaymentBookingProjection.booking_id == payment.booking_id)
+        ).scalar_one_or_none()
+        enqueue_event_sync(
+            db,
+            topic="payment-events",
+            event_type="payment.refunded",
+            event_key=str(payment.id),
+            payload={
+                "payment_id": str(payment.id),
+                "booking_id": str(payment.booking_id),
+                "booking_number": projection.booking_number if projection else str(payment.booking_id),
+                "user_id": str(projection.user_id) if projection else None,
+                "pandit_id": str(projection.pandit_id) if projection else None,
+                "amount": float(payment.refund_amount or 0),
+                "reason": reason,
+                "refund_id": payment.refund_id,
+            },
+        )
 
         db.commit()
         logger.info(f"Refund {payment.refund_id} of ₹{payment.refund_amount} processed")
@@ -296,6 +332,20 @@ def release_expired_slot_locks():
             ))
 
             # Release Redis slot lock (belt+suspenders — TTL should have expired it already)
+            enqueue_event_sync(
+                db,
+                topic="booking-events",
+                event_type="booking.cancelled",
+                event_key=str(booking.id),
+                payload={
+                    "booking_id": str(booking.id),
+                    "booking_number": booking.booking_number,
+                    "user_id": str(booking.user_id),
+                    "pandit_id": str(booking.pandit_id),
+                    "reason": "Payment window expired",
+                    "cancelled_by": "system",
+                },
+            )
             slot_key = f"slot_lock:{booking.pandit_id}:{booking.scheduled_at.isoformat()}"
             r.delete(slot_key)
 

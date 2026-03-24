@@ -1,9 +1,6 @@
 version: "3.9"
 
 services:
-  # ── NGINX Load Balancer / Reverse Proxy ──────────────────────
-  # Acts as single entry point, distributes traffic across API instances,
-  # handles rate limiting, caching, circuit breaking
   nginx:
     build:
       context: .
@@ -11,11 +8,23 @@ services:
     ports:
       - "80:80"
     depends_on:
-      api1:
+      auth-service:
         condition: service_healthy
-      api2:
+      user-service:
         condition: service_healthy
-      api3:
+      pandit-service:
+        condition: service_healthy
+      booking-service:
+        condition: service_healthy
+      search-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+      review-service:
+        condition: service_healthy
+      admin-service:
         condition: service_healthy
     networks:
       - pandit_network
@@ -26,22 +35,30 @@ services:
         max-size: "10m"
         max-file: "3"
 
-  # ── Application - Instance 1 ────────────────────────────────
-  api1:
+  auth-service:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      SERVICE_NAME: auth-service
+      ENABLED_ROUTERS: auth
+      DATABASE_URL: postgresql+asyncpg://postgres:password@auth-postgres:5432/pandit_auth_db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
       ELASTICSEARCH_URL: http://elasticsearch:9200
-      INSTANCE_NAME: "api1"
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: auth-service
     depends_on:
-      postgres:
+      migrate-auth:
+        condition: service_completed_successfully
+      auth-postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      event-bus:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -57,28 +74,31 @@ services:
       start_period: 20s
     networks:
       - pandit_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Application - Instance 2 ────────────────────────────────
-  api2:
+  user-service:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      SERVICE_NAME: user-service
+      ENABLED_ROUTERS: user
+      DATABASE_URL: postgresql+asyncpg://postgres:password@user-postgres:5432/pandit_user_db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
       ELASTICSEARCH_URL: http://elasticsearch:9200
-      INSTANCE_NAME: "api2"
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: user-service
     depends_on:
-      postgres:
+      migrate-user:
+        condition: service_completed_successfully
+      user-postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      event-bus:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -94,28 +114,31 @@ services:
       start_period: 20s
     networks:
       - pandit_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Application - Instance 3 ────────────────────────────────
-  api3:
+  pandit-service:
     build:
       context: .
       dockerfile: Dockerfile
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      SERVICE_NAME: pandit-service
+      ENABLED_ROUTERS: pandit
+      DATABASE_URL: postgresql+asyncpg://postgres:password@pandit-postgres:5432/pandit_pandit_db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
       ELASTICSEARCH_URL: http://elasticsearch:9200
-      INSTANCE_NAME: "api3"
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: pandit-service
     depends_on:
-      postgres:
+      migrate-pandit:
+        condition: service_completed_successfully
+      pandit-postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      event-bus:
         condition: service_healthy
       elasticsearch:
         condition: service_healthy
@@ -131,23 +154,257 @@ services:
       start_period: 20s
     networks:
       - pandit_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── PostgreSQL + PostGIS ──────────────────────────────────────
-  postgres:
+  booking-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: booking-service
+      ENABLED_ROUTERS: booking
+      DATABASE_URL: postgresql+asyncpg://postgres:password@booking-postgres:5432/pandit_booking_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: booking-service
+    depends_on:
+      migrate-booking:
+        condition: service_completed_successfully
+      booking-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  search-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: search-service
+      ENABLED_ROUTERS: search
+      DATABASE_URL: postgresql+asyncpg://postgres:password@search-postgres:5432/pandit_search_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: search-service
+    depends_on:
+      migrate-search:
+        condition: service_completed_successfully
+      search-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: payment-service
+      ENABLED_ROUTERS: payment
+      DATABASE_URL: postgresql+asyncpg://postgres:password@payment-postgres:5432/pandit_payment_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: payment-service
+    depends_on:
+      migrate-payment:
+        condition: service_completed_successfully
+      payment-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: notification-service
+      ENABLED_ROUTERS: notification
+      DATABASE_URL: postgresql+asyncpg://postgres:password@notification-postgres:5432/pandit_notification_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: notification-service
+    depends_on:
+      migrate-notification:
+        condition: service_completed_successfully
+      notification-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  review-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: review-service
+      ENABLED_ROUTERS: review
+      DATABASE_URL: postgresql+asyncpg://postgres:password@review-postgres:5432/pandit_review_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: review-service
+    depends_on:
+      migrate-review:
+        condition: service_completed_successfully
+      review-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  admin-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      SERVICE_NAME: admin-service
+      ENABLED_ROUTERS: admin
+      DATABASE_URL: postgresql+asyncpg://postgres:password@admin-postgres:5432/pandit_admin_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      DB_AUTO_INIT: "false"
+      INSTANCE_NAME: admin-service
+    depends_on:
+      migrate-admin:
+        condition: service_completed_successfully
+      admin-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    volumes:
+      - .:/app
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers --forwarded-allow-ips="*"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - pandit_network
+
+  payment-postgres:
     image: postgis/postgis:16-3.4
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: pandit_db
+      POSTGRES_DB: pandit_payment_db
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - payment_postgres_data:/var/lib/postgresql/data
       - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -157,13 +414,311 @@ services:
     networks:
       - pandit_network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Redis ─────────────────────────────────────────────────────
+  booking-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_booking_db
+    ports:
+      - "5436:5432"
+    volumes:
+      - booking_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  user-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_user_db
+    ports:
+      - "5438:5432"
+    volumes:
+      - user_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  pandit-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_pandit_db
+    ports:
+      - "5439:5432"
+    volumes:
+      - pandit_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  search-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_search_db
+    ports:
+      - "5440:5432"
+    volumes:
+      - search_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  auth-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_auth_db
+    ports:
+      - "5441:5432"
+    volumes:
+      - auth_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  migrate-booking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@booking-postgres:5432/pandit_booking_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      booking-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@auth-postgres:5432/pandit_auth_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      auth-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@search-postgres:5432/pandit_search_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      search-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-pandit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@pandit-postgres:5432/pandit_pandit_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      pandit-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-user:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@user-postgres:5432/pandit_user_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      user-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-payment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@payment-postgres:5432/pandit_payment_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      payment-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  notification-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_notification_db
+    ports:
+      - "5434:5432"
+    volumes:
+      - notification_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  migrate-notification:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@notification-postgres:5432/pandit_notification_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      notification-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  review-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_review_db
+    ports:
+      - "5435:5432"
+    volumes:
+      - review_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  admin-postgres:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pandit_admin_db
+    ports:
+      - "5437:5432"
+    volumes:
+      - admin_postgres_data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  migrate-review:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@review-postgres:5432/pandit_review_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      review-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
+  migrate-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@admin-postgres:5432/pandit_admin_db
+      DB_AUTO_INIT: "false"
+    command: alembic upgrade head
+    depends_on:
+      admin-postgres:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: "no"
+
   redis:
     image: redis:7-alpine
     ports:
@@ -179,13 +734,7 @@ services:
     networks:
       - pandit_network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Elasticsearch ─────────────────────────────────────────────
   elasticsearch:
     image: elasticsearch:8.12.1
     environment:
@@ -204,12 +753,221 @@ services:
     networks:
       - pandit_network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
-  # ── Kibana (Elasticsearch UI) ─────────────────────────────────
+
+  event-bus:
+    image: redpandadata/redpanda:v24.2.8
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --node-id
+      - "0"
+      - --check=false
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr
+      - PLAINTEXT://event-bus:9092
+    ports:
+      - "9092:9092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster info > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-booking:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@booking-postgres:5432/pandit_booking_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-booking:
+        condition: service_completed_successfully
+      booking-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-user:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@user-postgres:5432/pandit_user_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-user:
+        condition: service_completed_successfully
+      user-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-pandit:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@pandit-postgres:5432/pandit_pandit_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-pandit:
+        condition: service_completed_successfully
+      pandit-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-search:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@search-postgres:5432/pandit_search_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-search:
+        condition: service_completed_successfully
+      search-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-auth:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@auth-postgres:5432/pandit_auth_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-auth:
+        condition: service_completed_successfully
+      auth-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-payment:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@payment-postgres:5432/pandit_payment_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-payment:
+        condition: service_completed_successfully
+      payment-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-review:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@review-postgres:5432/pandit_review_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-review:
+        condition: service_completed_successfully
+      review-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
+  outbox-relay-admin:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python -m shared.events.relay
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@admin-postgres:5432/pandit_admin_db
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+      OUTBOX_POLL_INTERVAL_SECONDS: "1"
+      DB_AUTO_INIT: "false"
+    depends_on:
+      migrate-admin:
+        condition: service_completed_successfully
+      admin-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    networks:
+      - pandit_network
+    restart: unless-stopped
+
   kibana:
     image: kibana:8.12.1
     ports:
@@ -220,40 +978,103 @@ services:
       elasticsearch:
         condition: service_healthy
     profiles:
-      - dev-tools  # Only start with: docker-compose --profile dev-tools up
+      - dev-tools
     networks:
       - pandit_network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Celery Worker ─────────────────────────────────────────────
   celery-worker:
     build:
       context: .
       dockerfile: Dockerfile
-    command: celery -A tasks.celery_app worker --loglevel=info --queues=notifications,payouts,default
+    command: celery -A tasks.celery_app worker --loglevel=info --queues=notifications
     env_file: .env
     environment:
-      DATABASE_URL: postgresql+asyncpg://postgres:password@postgres:5432/pandit_db
+      DATABASE_URL: postgresql+asyncpg://postgres:password@notification-postgres:5432/pandit_notification_db
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
     depends_on:
-      - redis
-      - postgres
+      migrate-notification:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      notification-postgres:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - pandit_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
-  # ── Flower (Celery monitoring) ────────────────────────────────
+  celery-booking-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A tasks.celery_app worker --loglevel=info --queues=default
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@booking-postgres:5432/pandit_booking_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      migrate-booking:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      booking-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pandit_network
+
+  celery-payment-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A tasks.celery_app worker --loglevel=info --queues=payments
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@payment-postgres:5432/pandit_payment_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      KAFKA_BOOTSTRAP_SERVERS: event-bus:9092
+      EVENT_BUS_ENABLED: "true"
+    depends_on:
+      migrate-payment:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      payment-postgres:
+        condition: service_healthy
+      event-bus:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pandit_network
+
+  celery-beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: celery -A tasks.celery_app beat --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:password@booking-postgres:5432/pandit_booking_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    depends_on:
+      migrate-booking:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      booking-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pandit_network
+
   flower:
     build:
       context: .
@@ -271,18 +1092,20 @@ services:
     networks:
       - pandit_network
     restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
 
 volumes:
-  postgres_data:
+  booking_postgres_data:
+  user_postgres_data:
+  pandit_postgres_data:
+  search_postgres_data:
+  auth_postgres_data:
+  payment_postgres_data:
+  notification_postgres_data:
+  review_postgres_data:
+  admin_postgres_data:
   redis_data:
   es_data:
 
-# Explicit network so compose doesn't complain
 networks:
   pandit_network:
     driver: bridge

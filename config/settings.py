@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     DATABASE_POOL_SIZE: int = 20
     DATABASE_MAX_OVERFLOW: int = 40
     DATABASE_POOL_TIMEOUT: int = 30
+    DB_AUTO_INIT: bool = True
 
     # ── Redis ────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
@@ -63,6 +64,7 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
+    RAZORPAY_ACCOUNT_NUMBER: str = ""
     PLATFORM_COMMISSION_PERCENT: float = 10.0
 
     # ── Firebase ─────────────────────────────────────────────
@@ -96,9 +98,15 @@ class Settings(BaseSettings):
     CELERY_BROKER_URL: str = "redis://localhost:6379/1"
     CELERY_RESULT_BACKEND: str = "redis://localhost:6379/2"
 
+    # â”€â”€ Event Bus (Kafka/Redpanda) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    EVENT_BUS_ENABLED: bool = True
+    KAFKA_BOOTSTRAP_SERVERS: str = "event-bus:9092"
+    OUTBOX_POLL_INTERVAL_SECONDS: float = 1.0
+
     # ── OpenTelemetry ────────────────────────────────────────
     OTEL_EXPORTER_OTLP_ENDPOINT: str = "http://localhost:4317"
     OTEL_SERVICE_NAME: str = "pandit-booking-api"
+    THIRD_PARTY_STRICT_STARTUP: bool = False
 
     # ── Rate Limiting ────────────────────────────────────────
     RATE_LIMIT_PER_MINUTE: int = 100

@@ -11,13 +11,12 @@ Beat scheduler (periodic tasks):
 
 from celery import Celery
 from celery.schedules import crontab
-
 from config.settings import settings
 
 celery_app = Celery(
     "pandit_booking",
-    broker=settings.REDIS_URL,
-    backend=settings.REDIS_URL,
+    broker=settings.CELERY_BROKER_URL,
+    backend=settings.CELERY_RESULT_BACKEND,
     include=[
         "tasks.notification_tasks",
         "tasks.payment_tasks",
@@ -55,12 +54,16 @@ celery_app.conf.update(
     # Routing: separate queues for different priority levels
     task_routes={
         "tasks.notification_tasks.*": {"queue": "notifications"},
-        "tasks.payment_tasks.process_payout": {"queue": "payments"},
+        "tasks.payment_tasks.process_single_payout": {"queue": "payments"},
+        "tasks.payment_tasks.process_pending_payouts": {"queue": "payments"},
+        "tasks.payment_tasks.process_refund": {"queue": "payments"},
         "tasks.payment_tasks.release_expired_slot_locks": {"queue": "default"},
     },
 
     # Worker prefetch: 1 task at a time for long-running tasks
     worker_prefetch_multiplier=1,
+    # Ensure broker reconnect behavior is explicit at startup
+    broker_connection_retry_on_startup=True,
 )
 
 # ── Periodic Tasks (Beat Schedule) ────────────────────────────────────────────
@@ -73,23 +76,18 @@ celery_app.conf.beat_schedule = {
         "schedule": 300,  # every 5 minutes
     },
 
-    # Send booking reminders 24 hours before scheduled pooja
-    # Runs every hour to catch newly created bookings
     "send-booking-reminders": {
         "task": "tasks.notification_tasks.send_booking_reminders",
-        "schedule": crontab(minute=0),  # top of every hour
+        "schedule": crontab(minute=0),
     },
 
-    # Process pending payouts for COMPLETED bookings (escrow release)
-    # Runs nightly at 2 AM IST
     "process-nightly-payouts": {
         "task": "tasks.payment_tasks.process_pending_payouts",
-        "schedule": crontab(hour=20, minute=30),  # 02:00 IST = 20:30 UTC
+        "schedule": crontab(hour=20, minute=30),
     },
 
-    # Send review request to users 2 hours after booking completion
     "send-review-requests": {
         "task": "tasks.notification_tasks.send_review_requests",
-        "schedule": crontab(minute=0),  # every hour
+        "schedule": crontab(minute=0),
     },
 }

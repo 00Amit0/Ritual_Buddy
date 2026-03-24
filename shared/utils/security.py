@@ -104,12 +104,14 @@ def verify_razorpay_signature(
     order_id: str,
     payment_id: str,
     signature: str,
+    secret: Optional[str] = None,
 ) -> bool:
     """Verify Razorpay payment signature using HMAC-SHA256."""
     import hmac
+    key = secret or settings.RAZORPAY_WEBHOOK_SECRET
     body = f"{order_id}|{payment_id}"
     expected = hmac.new(
-        settings.RAZORPAY_WEBHOOK_SECRET.encode(),
+        key.encode(),
         body.encode(),
         hashlib.sha256,
     ).hexdigest()

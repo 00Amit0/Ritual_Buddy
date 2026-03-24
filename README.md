@@ -61,6 +61,27 @@ psql pandit_db -c "CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";"
 alembic upgrade head
 ```
 
+### Migration Workflow (Production)
+```bash
+# Create a migration from model changes
+alembic revision --autogenerate -m "describe_change"
+
+# Review generated file in migrations/versions/
+
+# Apply pending migrations
+alembic upgrade head
+
+# Roll back one revision (if needed)
+alembic downgrade -1
+```
+
+For Docker deployments, migrations run as a one-shot `migrate` service before API containers start.
+
+If your database already has tables created before Alembic was introduced, run this once before enabling automated migration runs:
+```bash
+alembic stamp head
+```
+
 ### 4. Run Services
 
 #### Option A: All-in-one (development)

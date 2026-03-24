@@ -17,17 +17,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.database import get_db
 from config.redis_client import RedisCache, get_redis
 from config.settings import settings
-from shared.middleware.auth import get_current_user, require_pandit
+from shared.events.outbox import enqueue_event
+from shared.middleware.auth import (
+    get_current_principal,
+    require_pandit_principal,
+)
 from shared.models.models import (
     Booking,
+    BookingAvailabilityProjection,
     BookingAuditLog,
+    BookingPanditProjection,
     BookingStatus,
-    PanditAvailability,
-    PanditProfile,
     Pooja,
-    User,
     UserRole,
-    VerificationStatus,
 )
 from shared.schemas.schemas import (
     BookingCancelRequest,
@@ -62,7 +64,7 @@ async def _log_status_change(
     booking: Booking,
     from_status: str,
     to_status: str,
-    changed_by: User,
+    changed_by_id: str | UUID | None,
     reason: str = None,
     metadata: dict = None,
 ):
@@ -71,7 +73,7 @@ async def _log_status_change(
         booking_id=booking.id,
         from_status=from_status,
         to_status=to_status,
-        changed_by_id=changed_by.id,
+        changed_by_id=UUID(str(changed_by_id)) if changed_by_id else None,
         reason=reason,
         metadata=metadata,
     )
@@ -87,40 +89,11 @@ def _enrich_booking(booking: Booking) -> BookingResponse:
     )
 
 
-async def _send_notification_async(
-    user_id: str,
-    notification_type: str,
-    title: str,
-    body: str,
-    booking_id: str = None,
-    db: AsyncSession = None,
-):
-    """
-    Fire-and-forget notification. In production, publish to Kafka/BullMQ.
-    For now, we store in DB directly.
-    """
-    from shared.models.models import Notification, NotificationType
-    try:
-        notif = Notification(
-            user_id=user_id,
-            booking_id=booking_id,
-            type=NotificationType[notification_type],
-            title=title,
-            body=body,
-        )
-        db.add(notif)
-        # In production: also push to FCM, SMS etc. via notification service
-    except Exception:
-        pass  # Don't fail booking flow on notification errors
-
-
-# ── Booking Creation (Saga Step 1) ────────────────────────────
-
 @router.post("", response_model=BookingResponse, status_code=status.HTTP_201_CREATED)
 async def create_booking(
     data: BookingCreateRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -136,11 +109,13 @@ async def create_booking(
         raise HTTPException(status_code=403, detail="Pandits cannot book other pandits")
 
     # Step 1: Validate pandit
-    result = await db.execute(select(PanditProfile).where(PanditProfile.id == data.pandit_id))
+    result = await db.execute(
+        select(BookingPanditProjection).where(BookingPanditProjection.pandit_id == data.pandit_id)
+    )
     pandit = result.scalar_one_or_none()
     if not pandit:
         raise HTTPException(status_code=404, detail="Pandit not found")
-    if pandit.verification_status != VerificationStatus.VERIFIED:
+    if pandit.verification_status != "VERIFIED":
         raise HTTPException(status_code=400, detail="Pandit is not verified")
     if not pandit.is_available:
         raise HTTPException(status_code=400, detail="Pandit is currently not accepting bookings")
@@ -154,11 +129,11 @@ async def create_booking(
     # Step 3: Check availability slot
     scheduled_date = data.scheduled_at.date()
     slot_result = await db.execute(
-        select(PanditAvailability).where(
-            PanditAvailability.pandit_id == pandit.id,
-            func.date(PanditAvailability.date) == scheduled_date,
-            PanditAvailability.is_booked == False,
-            PanditAvailability.is_blocked == False,
+        select(BookingAvailabilityProjection).where(
+            BookingAvailabilityProjection.pandit_id == pandit.pandit_id,
+            func.date(BookingAvailabilityProjection.date) == scheduled_date,
+            BookingAvailabilityProjection.is_booked == False,
+            BookingAvailabilityProjection.is_blocked == False,
         )
     )
     available_slot = slot_result.scalars().first()
@@ -169,10 +144,9 @@ async def create_booking(
         )
 
     # Step 4: Soft-lock slot in Redis
-    slot_key = f"{pandit.id}:{data.scheduled_at.isoformat()}"
     cache = RedisCache(redis)
 
-    existing_lock = await cache.get_slot_lock(str(pandit.id), data.scheduled_at.isoformat())
+    existing_lock = await cache.get_slot_lock(str(pandit.pandit_id), data.scheduled_at.isoformat())
     if existing_lock:
         raise HTTPException(
             status_code=409,
@@ -189,7 +163,7 @@ async def create_booking(
     booking = Booking(
         booking_number=_generate_booking_number(),
         user_id=current_user.id,
-        pandit_id=pandit.id,
+        pandit_id=pandit.pandit_id,
         pooja_id=pooja.id,
         scheduled_at=data.scheduled_at,
         duration_hrs=pooja.avg_duration_hrs,
@@ -206,10 +180,30 @@ async def create_booking(
     await db.flush()
 
     # Lock slot in Redis
-    await cache.lock_slot(str(pandit.id), data.scheduled_at.isoformat(), str(booking.id))
+    await cache.lock_slot(str(pandit.pandit_id), data.scheduled_at.isoformat(), str(booking.id))
 
     # Audit log
-    await _log_status_change(db, booking, None, BookingStatus.SLOT_LOCKED.value, current_user)
+    await _log_status_change(db, booking, None, BookingStatus.SLOT_LOCKED.value, current_user.id)
+    await enqueue_event(
+        db,
+        topic="booking-events",
+        event_type="booking.created",
+        event_key=str(booking.id),
+        payload={
+            "booking_id": str(booking.id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "pandit_user_id": str(pandit.user_id),
+            "pooja_id": str(booking.pooja_id),
+            "scheduled_at": booking.scheduled_at.isoformat(),
+            "duration_hrs": float(booking.duration_hrs),
+            "total_amount": float(booking.total_amount),
+            "platform_fee": float(booking.platform_fee),
+            "pandit_payout": float(booking.pandit_payout),
+            "status": booking.status.value,
+        },
+    )
     await db.commit()
 
     return _enrich_booking(booking)
@@ -224,45 +218,19 @@ async def payment_confirmed(
     redis=Depends(get_redis),
 ):
     """
-    Internal endpoint called by Payment Service after successful payment.
-    Transitions booking: SLOT_LOCKED → AWAITING_PANDIT.
-    Notifies pandit to accept/decline.
+    Deprecated sync endpoint.
+    Booking status transitions are handled by booking-service Kafka consumers.
     """
-    booking = await _get_booking_or_404(booking_id, db)
-
-    if booking.status not in (BookingStatus.SLOT_LOCKED, BookingStatus.PAYMENT_PENDING):
-        raise HTTPException(status_code=400, detail=f"Cannot confirm payment for booking in {booking.status} state")
-
-    prev_status = booking.status.value
-    booking.status = BookingStatus.AWAITING_PANDIT
-
-    # Audit log
-    from shared.models.models import Notification, NotificationType
-    pandit_result = await db.execute(select(PanditProfile).where(PanditProfile.id == booking.pandit_id))
-    pandit = pandit_result.scalar_one_or_none()
-
-    if pandit:
-        # Notify pandit
-        notif = Notification(
-            user_id=pandit.user_id,
-            booking_id=booking.id,
-            type=NotificationType.BOOKING_CREATED,
-            title="New Booking Request 🙏",
-            body=f"You have a new booking request for {booking.scheduled_at.strftime('%d %b %Y')}. Please accept or decline within {settings.BOOKING_ACCEPT_DEADLINE_HOURS} hours.",
-        )
-        db.add(notif)
-
-    await db.commit()
-    return {"status": "ok"}
-
-
-# ── Pandit Accept/Decline ─────────────────────────────────────
+    raise HTTPException(
+        status_code=410,
+        detail="Deprecated endpoint. Use event-driven payment events to update booking state.",
+    )
 
 @router.post("/{booking_id}/accept", response_model=BookingResponse)
 async def accept_booking(
     booking_id: UUID,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -271,10 +239,10 @@ async def accept_booking(
 
     # Verify this pandit owns this booking
     pandit_result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(BookingPanditProjection).where(BookingPanditProjection.user_id == UUID(str(current_user.id)))
     )
     pandit = pandit_result.scalar_one_or_none()
-    if not pandit or booking.pandit_id != pandit.id:
+    if not pandit or booking.pandit_id != pandit.pandit_id:
         raise HTTPException(status_code=403, detail="Not authorized to accept this booking")
 
     if booking.status != BookingStatus.AWAITING_PANDIT:
@@ -293,10 +261,10 @@ async def accept_booking(
 
     # Mark slot as booked
     slot_result = await db.execute(
-        select(PanditAvailability).where(
-            PanditAvailability.pandit_id == pandit.id,
-            func.date(PanditAvailability.date) == booking.scheduled_at.date(),
-            PanditAvailability.is_booked == False,
+        select(BookingAvailabilityProjection).where(
+            BookingAvailabilityProjection.pandit_id == pandit.pandit_id,
+            func.date(BookingAvailabilityProjection.date) == booking.scheduled_at.date(),
+            BookingAvailabilityProjection.is_booked == False,
         )
     )
     slot = slot_result.scalars().first()
@@ -306,21 +274,25 @@ async def accept_booking(
 
     # Release Redis lock (permanent DB booking replaces it)
     cache = RedisCache(redis)
-    await cache.release_slot(str(pandit.id), booking.scheduled_at.isoformat())
+    await cache.release_slot(str(pandit.pandit_id), booking.scheduled_at.isoformat())
 
-    await _log_status_change(db, booking, prev_status, BookingStatus.CONFIRMED.value, current_user)
+    await _log_status_change(db, booking, prev_status, BookingStatus.CONFIRMED.value, current_user.id)
 
-    # Notify user
-    await _send_notification_async(
-        user_id=str(booking.user_id),
-        notification_type="BOOKING_CONFIRMED",
-        title="Booking Confirmed! 🎉",
-        body=f"Your booking #{booking.booking_number} has been confirmed by the Pandit.",
-        booking_id=str(booking.id),
-        db=db,
+    await enqueue_event(
+        db,
+        topic="booking-events",
+        event_type="booking.confirmed",
+        event_key=str(booking.id),
+        payload={
+            "booking_id": str(booking.id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "scheduled_at": booking.scheduled_at.isoformat(),
+        },
     )
-
     await db.commit()
+
     return _enrich_booking(booking)
 
 
@@ -329,7 +301,7 @@ async def decline_booking(
     booking_id: UUID,
     data: BookingDeclineRequest,
     background_tasks: BackgroundTasks,
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -340,10 +312,10 @@ async def decline_booking(
     booking = await _get_booking_or_404(booking_id, db)
 
     pandit_result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(BookingPanditProjection).where(BookingPanditProjection.user_id == UUID(str(current_user.id)))
     )
     pandit = pandit_result.scalar_one_or_none()
-    if not pandit or booking.pandit_id != pandit.id:
+    if not pandit or booking.pandit_id != pandit.pandit_id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     if booking.status != BookingStatus.AWAITING_PANDIT:
@@ -356,43 +328,44 @@ async def decline_booking(
 
     # Release slot lock
     cache = RedisCache(redis)
-    await cache.release_slot(str(pandit.id), booking.scheduled_at.isoformat())
+    await cache.release_slot(str(pandit.pandit_id), booking.scheduled_at.isoformat())
 
     await _log_status_change(
-        db, booking, prev_status, BookingStatus.DECLINED.value, current_user, data.reason
+        db, booking, prev_status, BookingStatus.DECLINED.value, current_user.id, data.reason
     )
 
-    # Trigger refund via Payment Service (in production: Kafka event)
-    # kafka_producer.send("payment.events", {"type": "REFUND_REQUESTED", "booking_id": str(booking.id)})
-
-    # Notify user
-    await _send_notification_async(
-        user_id=str(booking.user_id),
-        notification_type="BOOKING_DECLINED",
-        title="Booking Declined",
-        body=f"The Pandit has declined booking #{booking.booking_number}. A full refund will be processed within 3-5 business days.",
-        booking_id=str(booking.id),
-        db=db,
+    await enqueue_event(
+        db,
+        topic="booking-events",
+        event_type="booking.declined",
+        event_key=str(booking.id),
+        payload={
+            "booking_id": str(booking.id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "reason": data.reason,
+        },
     )
-
     await db.commit()
+
     return _enrich_booking(booking)
 
 
 @router.post("/{booking_id}/complete", response_model=BookingResponse)
 async def complete_booking(
     booking_id: UUID,
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Pandit marks booking as completed. Triggers payout + review request."""
     booking = await _get_booking_or_404(booking_id, db)
 
     pandit_result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(BookingPanditProjection).where(BookingPanditProjection.user_id == UUID(str(current_user.id)))
     )
     pandit = pandit_result.scalar_one_or_none()
-    if not pandit or booking.pandit_id != pandit.id:
+    if not pandit or booking.pandit_id != pandit.pandit_id:
         raise HTTPException(status_code=403, detail="Not authorized")
 
     if booking.status != BookingStatus.CONFIRMED:
@@ -402,12 +375,23 @@ async def complete_booking(
     booking.status = BookingStatus.COMPLETED
     booking.completed_at = datetime.now(timezone.utc)
 
-    await _log_status_change(db, booking, prev_status, BookingStatus.COMPLETED.value, current_user)
+    await _log_status_change(db, booking, prev_status, BookingStatus.COMPLETED.value, current_user.id)
 
-    # Trigger payout (Kafka: payment.events → payout job)
-    # Trigger review request notification (24hr delay via BullMQ)
-
+    await enqueue_event(
+        db,
+        topic="booking-events",
+        event_type="booking.completed",
+        event_key=str(booking.id),
+        payload={
+            "booking_id": str(booking.id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "completed_at": booking.completed_at.isoformat() if booking.completed_at else None,
+        },
+    )
     await db.commit()
+
     return _enrich_booking(booking)
 
 
@@ -415,7 +399,7 @@ async def complete_booking(
 async def cancel_booking(
     booking_id: UUID,
     data: BookingCancelRequest,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -449,16 +433,16 @@ async def cancel_booking(
 
     # Release slot lock if still held
     pandit_result = await db.execute(
-        select(PanditProfile).where(PanditProfile.id == booking.pandit_id)
+        select(BookingPanditProjection).where(BookingPanditProjection.pandit_id == booking.pandit_id)
     )
     pandit = pandit_result.scalar_one_or_none()
     if pandit:
         cache = RedisCache(redis)
-        await cache.release_slot(str(pandit.id), booking.scheduled_at.isoformat())
+        await cache.release_slot(str(pandit.pandit_id), booking.scheduled_at.isoformat())
 
         # Un-book the slot if it was marked booked
         slot_result = await db.execute(
-            select(PanditAvailability).where(PanditAvailability.booking_id == booking.id)
+            select(BookingAvailabilityProjection).where(BookingAvailabilityProjection.booking_id == booking.id)
         )
         slot = slot_result.scalar_one_or_none()
         if slot:
@@ -466,13 +450,25 @@ async def cancel_booking(
             slot.booking_id = None
 
     await _log_status_change(
-        db, booking, prev_status, BookingStatus.CANCELLED.value, current_user, data.reason
+        db, booking, prev_status, BookingStatus.CANCELLED.value, current_user.id, data.reason
     )
 
-    # Trigger refund
-    # kafka_producer.send("payment.events", {"type": "REFUND_REQUESTED", "booking_id": str(booking.id)})
-
+    await enqueue_event(
+        db,
+        topic="booking-events",
+        event_type="booking.cancelled",
+        event_key=str(booking.id),
+        payload={
+            "booking_id": str(booking.id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "reason": data.reason,
+            "cancelled_by": current_user.role.value,
+        },
+    )
     await db.commit()
+
     return _enrich_booking(booking)
 
 
@@ -481,7 +477,7 @@ async def cancel_booking(
 @router.get("/{booking_id}", response_model=BookingResponse)
 async def get_booking(
     booking_id: UUID,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Get booking details. User sees own, pandit sees their bookings, admin sees all."""
@@ -492,10 +488,10 @@ async def get_booking(
         raise HTTPException(status_code=403, detail="Not authorized")
     elif current_user.role == UserRole.PANDIT:
         pandit_result = await db.execute(
-            select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+            select(BookingPanditProjection).where(BookingPanditProjection.user_id == UUID(str(current_user.id)))
         )
         pandit = pandit_result.scalar_one_or_none()
-        if not pandit or booking.pandit_id != pandit.id:
+        if not pandit or booking.pandit_id != pandit.pandit_id:
             raise HTTPException(status_code=403, detail="Not authorized")
 
     return _enrich_booking(booking)
@@ -506,18 +502,18 @@ async def list_my_bookings(
     status_filter: str = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(10, ge=1, le=50),
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """List bookings for the current user. Pandits see bookings assigned to them."""
     if current_user.role == UserRole.PANDIT:
         pandit_result = await db.execute(
-            select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+            select(BookingPanditProjection).where(BookingPanditProjection.user_id == UUID(str(current_user.id)))
         )
         pandit = pandit_result.scalar_one_or_none()
         if not pandit:
             return []
-        query = select(Booking).where(Booking.pandit_id == pandit.id)
+        query = select(Booking).where(Booking.pandit_id == pandit.pandit_id)
     else:
         query = select(Booking).where(Booking.user_id == current_user.id)
 
@@ -531,3 +527,6 @@ async def list_my_bookings(
     result = await db.execute(query)
     bookings = result.scalars().all()
     return [_enrich_booking(b) for b in bookings]
+
+
+

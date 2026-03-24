@@ -79,8 +79,10 @@ class NotificationType(str, PyEnum):
     BOOKING_DECLINED = "BOOKING_DECLINED"
     BOOKING_CANCELLED = "BOOKING_CANCELLED"
     BOOKING_COMPLETED = "BOOKING_COMPLETED"
+    BOOKING_REMINDER = "BOOKING_REMINDER"
     PAYMENT_SUCCESS = "PAYMENT_SUCCESS"
     PAYMENT_FAILED = "PAYMENT_FAILED"
+    REVIEW_REQUEST = "REVIEW_REQUEST"
     REVIEW_RECEIVED = "REVIEW_RECEIVED"
     PAYOUT_SENT = "PAYOUT_SENT"
     ACCOUNT_VERIFIED = "ACCOUNT_VERIFIED"
@@ -616,4 +618,388 @@ class AdminAuditLog(Base):
     __table_args__ = (
         Index("ix_admin_audit_admin_id", "admin_id"),
         Index("ix_admin_audit_created_at", "created_at"),
+    )
+
+
+class OutboxEvent(TimestampMixin, Base):
+    """Transactional outbox row for reliable event publication."""
+    __tablename__ = "outbox_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.uuid_generate_v4()
+    )
+    topic: Mapped[str] = mapped_column(String(120), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    event_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    headers: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), default="NEW", nullable=False)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    last_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    available_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_outbox_status_available", "status", "available_at"),
+        Index("ix_outbox_event_key", "event_key"),
+        Index("ix_outbox_topic", "topic"),
+    )
+
+
+class PaymentBookingProjection(TimestampMixin, Base):
+    """Payment service local projection of booking data."""
+    __tablename__ = "payment_booking_projection"
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    platform_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    __table_args__ = (
+        Index("ix_payment_projection_user_status", "user_id", "status"),
+    )
+
+
+class BookingPanditProjection(TimestampMixin, Base):
+    """Booking service local projection of pandit state needed for booking decisions."""
+    __tablename__ = "booking_pandit_projection"
+
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    verification_status: Mapped[str] = mapped_column(String(40), nullable=False, default="PENDING")
+    is_available: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    base_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    pooja_fees: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    profile_complete: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        Index("ix_booking_pandit_projection_user", "user_id"),
+        Index("ix_booking_pandit_projection_status", "verification_status", "is_available"),
+    )
+
+
+class BookingAvailabilityProjection(TimestampMixin, Base):
+    """Booking service local projection of pandit availability slots."""
+    __tablename__ = "booking_availability_projection"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.uuid_generate_v4()
+    )
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    start_time: Mapped[str] = mapped_column(String(8), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(8), nullable=False)
+    is_booked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    booking_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    blocked_reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    __table_args__ = (
+        Index("ix_booking_availability_pandit_date", "pandit_id", "date"),
+        Index("ix_booking_availability_booking", "booking_id"),
+    )
+
+
+class PanditBookingProjection(TimestampMixin, Base):
+    """Pandit service local projection of booking lifecycle and payout state."""
+    __tablename__ = "pandit_booking_projection"
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    duration_hrs: Mapped[Decimal] = mapped_column(Numeric(4, 1), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    pandit_payout: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    payout_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    payout_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_pandit_booking_projection_pandit_status", "pandit_id", "status"),
+        Index("ix_pandit_booking_projection_scheduled", "pandit_id", "scheduled_at"),
+    )
+
+
+class SearchPanditProjection(TimestampMixin, Base):
+    """Search service local read model for pandit discovery and autocomplete."""
+    __tablename__ = "search_pandit_projection"
+
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    bio: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    languages: Mapped[list[str]] = mapped_column(ARRAY(String(50)), default=list)
+    poojas_offered: Mapped[list[uuid.UUID]] = mapped_column(ARRAY(UUID(as_uuid=True)), default=list)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    latitude: Mapped[Optional[float]] = mapped_column(Numeric(9, 6), nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(Numeric(9, 6), nullable=True)
+    rating_avg: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False, default=0.00)
+    rating_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    experience_years: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    base_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    service_radius_km: Mapped[Decimal] = mapped_column(Numeric(6, 2), nullable=False, default=25.0)
+    is_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    verification_status: Mapped[str] = mapped_column(String(40), nullable=False, default="PENDING")
+
+    __table_args__ = (
+        Index("ix_search_pandit_projection_name", "name"),
+        Index("ix_search_pandit_projection_status", "verification_status", "is_available"),
+        Index("ix_search_pandit_projection_city", "city"),
+    )
+
+
+class SearchPanditAvailabilityProjection(TimestampMixin, Base):
+    """Search service local copy of pandit availability for date filtering."""
+    __tablename__ = "search_pandit_availability_projection"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.uuid_generate_v4()
+    )
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    date: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    start_time: Mapped[str] = mapped_column(String(8), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(8), nullable=False)
+    is_booked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_search_pandit_availability_pandit_date", "pandit_id", "date"),
+    )
+
+
+class UserPanditProjection(TimestampMixin, Base):
+    """User service local projection for pandit discovery in saved favourites."""
+    __tablename__ = "user_pandit_projection"
+
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    rating_avg: Mapped[Decimal] = mapped_column(Numeric(3, 2), nullable=False, default=0.00)
+    rating_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    base_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    verification_status: Mapped[str] = mapped_column(String(40), nullable=False, default="PENDING")
+    is_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_user_pandit_projection_name", "name"),
+        Index("ix_user_pandit_projection_status", "verification_status", "is_available"),
+    )
+
+
+class UserAccountProjection(TimestampMixin, Base):
+    """User service local copy of authenticated user profile fields."""
+    __tablename__ = "user_account_projection"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), nullable=False)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="USER")
+    preferred_language: Mapped[str] = mapped_column(String(10), nullable=False, default="hi")
+    fcm_token: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (
+        Index("ix_user_account_projection_phone", "phone"),
+    )
+
+
+class PanditUserProjection(TimestampMixin, Base):
+    """Pandit service local copy of pandit account identity fields."""
+    __tablename__ = "pandit_user_projection"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class PanditReviewProjection(TimestampMixin, Base):
+    """Pandit service local store of public reviews."""
+    __tablename__ = "pandit_review_projection"
+
+    review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    booking_number: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    comment: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (
+        Index("ix_pandit_review_projection_pandit_visible", "pandit_id", "is_visible", "created_at"),
+    )
+
+
+class AdminPanditReviewProjection(TimestampMixin, Base):
+    """Admin service local queue projection for pandit verification review."""
+    __tablename__ = "admin_pandit_review_projection"
+
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, unique=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    experience_years: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    languages: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), nullable=True)
+    poojas_offered: Mapped[Optional[list[str]]] = mapped_column(ARRAY(String), nullable=True)
+    bio: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    documents: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    verification_status: Mapped[str] = mapped_column(String(40), nullable=False, default="PENDING")
+    is_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    profile_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    __table_args__ = (
+        Index("ix_admin_pandit_review_status", "verification_status", "created_at"),
+    )
+
+
+class AdminUserProjection(TimestampMixin, Base):
+    """Admin service local projection of user identity and status."""
+    __tablename__ = "admin_user_projection"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    name: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    email: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    role: Mapped[str] = mapped_column(String(20), nullable=False, default="USER")
+    is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (
+        Index("ix_admin_user_projection_role_active", "role", "is_active"),
+    )
+
+
+class AdminBookingProjection(TimestampMixin, Base):
+    """Admin service local booking read model."""
+    __tablename__ = "admin_booking_projection"
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pooja_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    total_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    platform_fee: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    pandit_payout: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    cancellation_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_admin_booking_projection_status_created", "status", "created_at"),
+        Index("ix_admin_booking_projection_user", "user_id", "created_at"),
+        Index("ix_admin_booking_projection_pandit", "pandit_id", "created_at"),
+    )
+
+
+class AdminPaymentProjection(TimestampMixin, Base):
+    """Admin service local payment read model."""
+    __tablename__ = "admin_payment_projection"
+
+    payment_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    pandit_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, default=0.00)
+    status: Mapped[str] = mapped_column(String(40), nullable=False, default="PENDING")
+    captured_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    refunded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_admin_payment_projection_status_captured", "status", "captured_at"),
+        Index("ix_admin_payment_projection_booking", "booking_id"),
+    )
+
+
+class AdminReviewProjection(TimestampMixin, Base):
+    """Admin service local review visibility/rating read model."""
+    __tablename__ = "admin_review_projection"
+
+    review_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    rating: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    is_visible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    __table_args__ = (
+        Index("ix_admin_review_projection_visible", "is_visible", "pandit_id"),
+    )
+
+
+class NotificationRecord(TimestampMixin, Base):
+    """Notification service local store without cross-service FK constraints."""
+    __tablename__ = "notification_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, server_default=func.uuid_generate_v4()
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    booking_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    type: Mapped[NotificationType] = mapped_column(Enum(NotificationType), nullable=False)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    data: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+    read_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    sent_push: Mapped[bool] = mapped_column(Boolean, default=False)
+    sent_sms: Mapped[bool] = mapped_column(Boolean, default=False)
+    sent_email: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    __table_args__ = (Index("ix_notification_records_user_id_read", "user_id", "is_read"),)
+
+
+class NotificationBookingProjection(TimestampMixin, Base):
+    """Notification service local booking projection for scheduled reminders."""
+    __tablename__ = "notification_booking_projection"
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_user_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+    scheduled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reminder_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_request_sent_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_submitted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_notification_booking_projection_status_scheduled", "status", "scheduled_at"),
+        Index("ix_notification_booking_projection_status_completed", "status", "completed_at"),
+    )
+
+
+class ReviewBookingProjection(TimestampMixin, Base):
+    """Review service local projection of booking ownership/status."""
+    __tablename__ = "review_booking_projection"
+
+    booking_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    booking_number: Mapped[str] = mapped_column(String(20), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    pandit_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(40), nullable=False)
+
+    __table_args__ = (
+        Index("ix_review_projection_user_status", "user_id", "status"),
+        Index("ix_review_projection_pandit", "pandit_id"),
     )

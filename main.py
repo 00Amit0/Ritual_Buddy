@@ -29,6 +29,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from config.database import close_db, init_db
 from config.redis_client import close_redis, init_redis
 from config.settings import settings
+from shared.utils.third_party import integration_status, validate_integrations_for_env
 
 # Service routers
 from services.auth.router import router as auth_router
@@ -44,6 +45,18 @@ from services.admin.router import router as admin_router
 # Resilience patterns
 from pybreaker import CircuitBreaker
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+ROUTER_REGISTRY = {
+    "auth": auth_router,
+    "user": user_router,
+    "pandit": pandit_router,
+    "booking": booking_router,
+    "search": search_router,
+    "payment": payment_router,
+    "notification": notification_router,
+    "review": review_router,
+    "admin": admin_router,
+}
 
 
 # ── Resilience: Circuit Breaker ──────────────────────────────
@@ -104,23 +117,37 @@ logger.handlers = [handler]
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle handler."""
+    service_name = os.getenv("SERVICE_NAME", "monolith")
+    consumer_task = None
     print("🚀 Starting Pandit Booking Platform API...")
 
+    validate_integrations_for_env()
+
     # Initialize connections
-    await init_db()
-    print("✅ Database connected")
+    if settings.DB_AUTO_INIT and not settings.is_production:
+        await init_db()
+        print("✅ Database initialized")
+    else:
+        print("ℹ️  Skipping automatic schema initialization")
 
     await init_redis()
     print("✅ Redis connected")
+    try:
+        from shared.events.consumers import start_service_consumer
+        consumer_task = await start_service_consumer(service_name)
+    except Exception as exc:
+        logger.error(f"Failed to start event consumer for {service_name}: {exc}")
 
-    # Seed initial data (poojas, etc.) — only in dev
-    if settings.APP_ENV == "development":
+    # Search needs local pooja reference data in its own DB.
+    if service_name == "search-service" or settings.APP_ENV == "development":
         await seed_initial_data()
 
     print(f"🕉️  {settings.APP_NAME} v{settings.APP_VERSION} is ready!")
     yield
 
     # Cleanup
+    if consumer_task:
+        consumer_task.cancel()
     await close_redis()
     await close_db()
     print("👋 Server shutdown complete")
@@ -129,6 +156,8 @@ async def lifespan(app: FastAPI):
 # ── App Factory ───────────────────────────────────────────────
 
 def create_app() -> FastAPI:
+    service_name = os.getenv("SERVICE_NAME", "monolith")
+    enabled_routers = os.getenv("ENABLED_ROUTERS", "all").strip().lower()
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
@@ -310,7 +339,7 @@ Get a token via the `/auth/google` OAuth flow.
             checks["database"] = "error"
             checks["status"] = "degraded"
 
-        # Redis check
+    # Redis check
         try:
             if redis_client:
                 await redis_client.ping()
@@ -318,6 +347,8 @@ Get a token via the `/auth/google` OAuth flow.
         except Exception:
             checks["redis"] = "error"
             checks["status"] = "degraded"
+
+        checks["integrations"] = integration_status()
 
         status_code = 200 if checks["status"] == "ok" else 503
         return JSONResponse(content=checks, status_code=status_code)
@@ -327,22 +358,23 @@ Get a token via the `/auth/google` OAuth flow.
         return {
             "name": settings.APP_NAME,
             "version": settings.APP_VERSION,
+            "service": service_name,
             "docs": "/docs",
             "health": "/health",
         }
 
-    # Register all service routers
-    app.include_router(auth_router)
-    app.include_router(user_router)
-    app.include_router(pandit_router)
-    app.include_router(booking_router)
-    app.include_router(search_router)
-    app.include_router(payment_router)
-    app.include_router(notification_router)
-    app.include_router(review_router)
-    app.include_router(admin_router)
+    # Register only the routers required by this deployment unit.
+    selected_router_keys = (
+        list(ROUTER_REGISTRY.keys())
+        if enabled_routers in {"", "all"}
+        else [r.strip().lower() for r in enabled_routers.split(",") if r.strip()]
+    )
+    for key in selected_router_keys:
+        router = ROUTER_REGISTRY.get(key)
+        if router is not None:
+            app.include_router(router)
 
-    # ── Prometheus Metrics ─────────────────────────────────────────
+    # ── Prometheus Metrics─────────────────────────────────────────
     # Instrument FastAPI with Prometheus metrics
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", tags=["Monitoring"])
 
@@ -401,3 +433,5 @@ if __name__ == "__main__":
         log_level="debug" if settings.DEBUG else "info",
         access_log=True,
     )
+
+

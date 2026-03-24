@@ -28,7 +28,6 @@ env/
 pytest.ini
 .gitattributes
 scripts/
-migrations/
 tests/
 *.md
 !requirements.txt

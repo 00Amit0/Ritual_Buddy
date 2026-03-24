@@ -15,16 +15,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
 from config.redis_client import RedisCache, get_redis
-from shared.middleware.auth import get_current_user, require_pandit
+from shared.events.outbox import enqueue_event
+from shared.middleware.auth import require_pandit_principal
 from shared.models.models import (
-    Booking,
-    BookingStatus,
     PanditAvailability,
+    PanditBookingProjection,
     PanditProfile,
-    Payment,
-    PaymentStatus,
-    User,
-    UserRole,
+    PanditReviewProjection,
+    PanditUserProjection,
     VerificationStatus,
 )
 from shared.schemas.schemas import (
@@ -50,19 +48,21 @@ async def _get_pandit_or_404(pandit_id: UUID, db: AsyncSession) -> PanditProfile
     return pandit
 
 
-async def _enrich_profile(pandit: PanditProfile, db: AsyncSession) -> PanditProfileResponse:
-    """Add name, avatar from joined User, and extract lat/lng from PostGIS point."""
-    result = await db.execute(select(User).where(User.id == pandit.user_id))
-    user = result.scalar_one_or_none()
-
+async def _extract_lat_lng(pandit: PanditProfile, db: AsyncSession) -> tuple[float | None, float | None]:
     lat, lng = None, None
     if pandit.location is not None:
-        geo_json = await db.scalar(
-            select(ST_AsGeoJSON(pandit.location))
-        )
+        geo_json = await db.scalar(select(ST_AsGeoJSON(pandit.location)))
         if geo_json:
             coords = json.loads(geo_json)["coordinates"]
             lng, lat = coords[0], coords[1]
+    return lat, lng
+
+
+async def _enrich_profile(pandit: PanditProfile, db: AsyncSession) -> PanditProfileResponse:
+    """Add name, avatar from joined User, and extract lat/lng from PostGIS point."""
+    user = await db.get(PanditUserProjection, pandit.user_id)
+
+    lat, lng = await _extract_lat_lng(pandit, db)
 
     return PanditProfileResponse(
         **{
@@ -140,15 +140,14 @@ async def get_pandit_reviews(
     db: AsyncSession = Depends(get_db),
 ):
     """Get paginated public reviews for a pandit."""
-    from shared.models.models import Review
     from shared.schemas.schemas import ReviewResponse
 
     pandit = await _get_pandit_or_404(pandit_id, db)
 
     query = (
-        select(Review)
-        .where(Review.pandit_id == pandit.id, Review.is_visible == True)
-        .order_by(Review.created_at.desc())
+        select(PanditReviewProjection)
+        .where(PanditReviewProjection.pandit_id == pandit.id, PanditReviewProjection.is_visible == True)
+        .order_by(PanditReviewProjection.created_at.desc())
     )
     total_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = total_result.scalar()
@@ -157,7 +156,21 @@ async def get_pandit_reviews(
     reviews = result.scalars().all()
 
     return {
-        "items": [ReviewResponse.model_validate(r) for r in reviews],
+        "items": [
+            ReviewResponse(
+                id=r.review_id,
+                booking_id=r.booking_id,
+                user_id=r.user_id,
+                pandit_id=r.pandit_id,
+                rating=r.rating,
+                comment=r.comment,
+                is_flagged=False,
+                flag_reason=None,
+                is_visible=r.is_visible,
+                created_at=r.created_at,
+            )
+            for r in reviews
+        ],
         "total": total,
         "page": page,
         "page_size": page_size,
@@ -168,12 +181,12 @@ async def get_pandit_reviews(
 
 @router.get("/me/profile", response_model=PanditProfileResponse)
 async def get_my_profile(
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Get the authenticated pandit's own profile."""
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
     if not pandit:
@@ -184,7 +197,7 @@ async def get_my_profile(
 @router.put("/me/profile", response_model=PanditProfileResponse)
 async def update_my_profile(
     update_data: PanditProfileUpdate,
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -193,13 +206,13 @@ async def update_my_profile(
     If location provided, updates PostGIS point and Redis GEO.
     """
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
 
     if not pandit:
         # Auto-create profile on first update
-        pandit = PanditProfile(user_id=current_user.id)
+        pandit = PanditProfile(user_id=UUID(str(current_user.id)))
         db.add(pandit)
 
     # Apply updates
@@ -228,13 +241,41 @@ async def update_my_profile(
     ])
 
     await db.flush()
+    lat, lng = await _extract_lat_lng(pandit, db)
 
     # Invalidate cache
     cache = RedisCache(redis)
     await cache.delete(f"pandit:{pandit.id}")
 
-    # TODO: Emit PanditUpdated event to Kafka → Elasticsearch re-index
-    # await kafka_producer.send("pandit.updates", {...})
+    await enqueue_event(
+        db,
+        topic="pandit-events",
+        event_type="pandit.updated",
+        event_key=str(pandit.id),
+        payload={
+            "pandit_id": str(pandit.id),
+            "user_id": str(pandit.user_id),
+            "city": pandit.city,
+            "state": pandit.state,
+            "profile_complete": bool(pandit.profile_complete),
+            "verification_status": pandit.verification_status.value,
+            "is_available": bool(pandit.is_available),
+            "base_fee": float(pandit.base_fee or 0),
+            "pooja_fees": pandit.pooja_fees or {},
+            "experience_years": int(pandit.experience_years or 0),
+            "languages": pandit.languages or [],
+            "poojas_offered": [str(p) for p in (pandit.poojas_offered or [])],
+            "service_radius_km": float(pandit.service_radius_km or 25),
+            "bio": pandit.bio,
+            "documents": pandit.documents or {},
+            "latitude": lat,
+            "longitude": lng,
+            "rating_avg": float(pandit.rating_avg),
+            "rating_count": int(pandit.rating_count or 0),
+            "updated_by": str(current_user.id),
+        },
+    )
+    await db.commit()
 
     profile = await _enrich_profile(pandit, db)
     return profile
@@ -243,7 +284,7 @@ async def update_my_profile(
 @router.put("/me/availability", response_model=MessageResponse)
 async def update_my_availability(
     data: PanditAvailabilityUpdate,
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -251,7 +292,7 @@ async def update_my_availability(
     If replace_date is provided, all existing slots for that date are deleted first.
     """
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
     if not pandit:
@@ -270,6 +311,7 @@ async def update_my_availability(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid replace_date format")
 
+    emitted_slots = []
     for slot in data.slots:
         try:
             slot_date = datetime.strptime(slot.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -291,6 +333,28 @@ async def update_my_availability(
                 start_time=slot.start_time,
                 end_time=slot.end_time,
             ))
+        emitted_slots.append(
+            {
+                "date": slot_date.isoformat(),
+                "start_time": slot.start_time,
+                "end_time": slot.end_time,
+                "is_blocked": False,
+                "blocked_reason": None,
+            }
+        )
+
+    await enqueue_event(
+        db,
+        topic="pandit-events",
+        event_type="pandit.availability_replaced",
+        event_key=str(pandit.id),
+        payload={
+            "pandit_id": str(pandit.id),
+            "replace_date": data.replace_date,
+            "slots": emitted_slots,
+            "updated_by": str(current_user.id),
+        },
+    )
 
     await db.commit()
     return MessageResponse(message=f"{len(data.slots)} availability slots updated")
@@ -300,12 +364,12 @@ async def update_my_availability(
 async def get_my_calendar(
     month: int = Query(..., ge=1, le=12),
     year: int = Query(..., ge=2024),
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Get calendar view: all bookings + availability for a given month."""
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
     if not pandit:
@@ -316,17 +380,12 @@ async def get_my_calendar(
     start = datetime(year, month, 1, tzinfo=timezone.utc)
     end = datetime(year, month, last_day, 23, 59, 59, tzinfo=timezone.utc)
 
-    # Get bookings
     bookings_result = await db.execute(
-        select(Booking).where(
-            Booking.pandit_id == pandit.id,
-            Booking.scheduled_at >= start,
-            Booking.scheduled_at <= end,
-            Booking.status.in_([
-                BookingStatus.CONFIRMED,
-                BookingStatus.IN_PROGRESS,
-                BookingStatus.AWAITING_PANDIT,
-            ]),
+        select(PanditBookingProjection).where(
+            PanditBookingProjection.pandit_id == pandit.id,
+            PanditBookingProjection.scheduled_at >= start,
+            PanditBookingProjection.scheduled_at <= end,
+            PanditBookingProjection.status.in_(["CONFIRMED", "IN_PROGRESS", "AWAITING_PANDIT"]),
         )
     )
     bookings = bookings_result.scalars().all()
@@ -346,11 +405,11 @@ async def get_my_calendar(
         "month": month,
         "bookings": [
             {
-                "id": str(b.id),
+                "id": str(b.booking_id),
                 "booking_number": b.booking_number,
                 "scheduled_at": b.scheduled_at.isoformat(),
                 "duration_hrs": float(b.duration_hrs),
-                "status": b.status.value,
+                "status": b.status,
             }
             for b in bookings
         ],
@@ -370,45 +429,41 @@ async def get_my_calendar(
 
 @router.get("/me/earnings")
 async def get_my_earnings(
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Earnings summary: lifetime, current month, pending payout."""
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
     if not pandit:
         raise HTTPException(status_code=404, detail="Pandit profile not found")
 
-    # Total lifetime earnings
     total_result = await db.execute(
-        select(func.sum(Payment.payout_amount)).where(
-            Payment.status == PaymentStatus.CAPTURED,
-            Payment.booking_id.in_(
-                select(Booking.id).where(Booking.pandit_id == pandit.id)
-            ),
+        select(func.sum(PanditBookingProjection.payout_amount)).where(
+            PanditBookingProjection.pandit_id == pandit.id,
+            PanditBookingProjection.payout_amount > 0,
         )
     )
     total_earned = total_result.scalar() or 0
 
-    # Pending (completed bookings, not yet paid out)
     pending_result = await db.execute(
-        select(func.sum(Booking.pandit_payout)).where(
-            Booking.pandit_id == pandit.id,
-            Booking.status == BookingStatus.COMPLETED,
+        select(func.sum(PanditBookingProjection.pandit_payout)).where(
+            PanditBookingProjection.pandit_id == pandit.id,
+            PanditBookingProjection.status == "COMPLETED",
+            PanditBookingProjection.payout_amount == 0,
         )
     )
     pending_payout = pending_result.scalar() or 0
 
-    # This month's bookings count
     now = datetime.now(timezone.utc)
     month_start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
     month_result = await db.execute(
         select(func.count()).where(
-            Booking.pandit_id == pandit.id,
-            Booking.status == BookingStatus.COMPLETED,
-            Booking.completed_at >= month_start,
+            PanditBookingProjection.pandit_id == pandit.id,
+            PanditBookingProjection.status == "COMPLETED",
+            PanditBookingProjection.completed_at >= month_start,
         )
     )
     bookings_this_month = month_result.scalar() or 0
@@ -426,7 +481,7 @@ async def get_my_earnings(
 async def update_my_location(
     latitude: float = Query(..., ge=-90, le=90),
     longitude: float = Query(..., ge=-180, le=180),
-    current_user: User = Depends(require_pandit),
+    current_user=Depends(require_pandit_principal),
     db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
 ):
@@ -435,7 +490,7 @@ async def update_my_location(
     Updates PostGIS + Redis GEO.
     """
     result = await db.execute(
-        select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        select(PanditProfile).where(PanditProfile.user_id == UUID(str(current_user.id)))
     )
     pandit = result.scalar_one_or_none()
     if not pandit:
@@ -446,5 +501,21 @@ async def update_my_location(
     # Update Redis GEO
     cache = RedisCache(redis)
     await cache.add_pandit_location(str(pandit.id), longitude, latitude)
+    await enqueue_event(
+        db,
+        topic="pandit-events",
+        event_type="pandit.location_updated",
+        event_key=str(pandit.id),
+        payload={
+            "pandit_id": str(pandit.id),
+            "user_id": str(pandit.user_id),
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+    )
+    await db.commit()
 
     return MessageResponse(message="Location updated")
+
+
+

@@ -34,6 +34,7 @@ elasticsearch[async]==8.12.1
 # Task Queue
 celery[redis]==5.3.6
 flower==2.0.1
+aiokafka==0.10.0
 
 # Payment
 razorpay==1.4.1

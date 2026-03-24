@@ -27,6 +27,16 @@ class TokenData:
         self.jti: str = payload["jti"]
 
 
+class TokenPrincipal:
+    """Lightweight authenticated principal from JWT claims only."""
+
+    def __init__(self, token_data: TokenData):
+        self.id: str = token_data.user_id
+        self.role: UserRole = token_data.role
+        self.email: str = token_data.email
+        self.is_active: bool = True
+
+
 async def get_token_data(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     redis=Depends(get_redis),
@@ -62,11 +72,11 @@ async def get_token_data(
     return TokenData(payload)
 
 
-async def get_current_user(
+async def get_current_user_record(
     token_data: TokenData = Depends(get_token_data),
     db: AsyncSession = Depends(get_db),
 ) -> User:
-    """Load full User object from database using JWT sub claim."""
+    """Auth-service/local dependency that loads the persisted user record."""
     result = await db.execute(select(User).where(User.id == token_data.user_id))
     user = result.scalar_one_or_none()
 
@@ -83,9 +93,23 @@ async def get_current_user(
     return user
 
 
+async def get_current_principal(
+    token_data: TokenData = Depends(get_token_data),
+) -> TokenPrincipal:
+    """JWT-only principal for services that don't need direct user-table lookup."""
+    return TokenPrincipal(token_data)
+
+
+async def get_current_user(
+    principal: TokenPrincipal = Depends(get_current_principal),
+) -> TokenPrincipal:
+    """Default authenticated identity for microservices: JWT claims only."""
+    return principal
+
+
 async def get_current_active_user(
-    current_user: User = Depends(get_current_user),
-) -> User:
+    current_user: TokenPrincipal = Depends(get_current_user),
+) -> TokenPrincipal:
     return current_user
 
 
@@ -97,8 +121,8 @@ class RoleRequired:
 
     async def __call__(
         self,
-        current_user: User = Depends(get_current_user),
-    ) -> User:
+        current_user: TokenPrincipal = Depends(get_current_user),
+    ) -> TokenPrincipal:
         if current_user.role not in self.roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -113,12 +137,34 @@ require_pandit = RoleRequired(UserRole.PANDIT, UserRole.ADMIN)
 require_admin = RoleRequired(UserRole.ADMIN)
 
 
+class RolePrincipalRequired:
+    """Role guard that works on JWT principal without user-table lookup."""
+
+    def __init__(self, *roles: UserRole):
+        self.roles = roles
+
+    async def __call__(
+        self,
+        principal: TokenPrincipal = Depends(get_current_principal),
+    ) -> TokenPrincipal:
+        if principal.role not in self.roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Required role: {[r.value for r in self.roles]}",
+            )
+        return principal
+
+
+require_user_principal = RolePrincipalRequired(UserRole.USER, UserRole.PANDIT, UserRole.ADMIN)
+require_pandit_principal = RolePrincipalRequired(UserRole.PANDIT, UserRole.ADMIN)
+require_admin_principal = RolePrincipalRequired(UserRole.ADMIN)
+
+
 async def get_optional_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-    db: AsyncSession = Depends(get_db),
     redis=Depends(get_redis),
-) -> Optional[User]:
-    """Returns current user if authenticated, None otherwise. For public endpoints."""
+) -> Optional[TokenPrincipal]:
+    """Returns JWT principal if authenticated, None otherwise."""
     if not credentials:
         return None
     try:
@@ -126,7 +172,6 @@ async def get_optional_user(
         jti = payload.get("jti")
         if jti and await redis.exists(f"jwt_revoked:{jti}"):
             return None
-        result = await db.execute(select(User).where(User.id == payload["sub"]))
-        return result.scalar_one_or_none()
+        return TokenPrincipal(TokenData(payload))
     except JWTError:
         return None

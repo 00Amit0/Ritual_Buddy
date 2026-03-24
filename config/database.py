@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy.pool import NullPool
 
 from config.settings import settings
 
@@ -49,7 +48,7 @@ class Base(DeclarativeBase):
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """
     FastAPI dependency: yields an async database session.
-    Auto-commits on success, rolls back on error.
+    Route handlers own commit/rollback. This dependency rolls back only on errors.
 
     Usage:
         @router.get("/users")
@@ -59,7 +58,6 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
@@ -73,7 +71,6 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
         try:
             yield session
-            await session.commit()
         except Exception:
             await session.rollback()
             raise
@@ -95,12 +92,15 @@ async def get_db_context() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Create all tables. Run during app startup."""
     async with engine.begin() as conn:
-
-        # Enable extensions separately (asyncpg requires single statements)
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
-        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
-
-        await conn.run_sync(Base.metadata.create_all)
+        # Prevent concurrent schema init across multiple API replicas.
+        await conn.execute(text("SELECT pg_advisory_lock(987654321)"))
+        try:
+            # Enable extensions separately (asyncpg requires single statements)
+            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis"))
+            await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+            await conn.run_sync(Base.metadata.create_all)
+        finally:
+            await conn.execute(text("SELECT pg_advisory_unlock(987654321)"))
 
 
 async def close_db() -> None:

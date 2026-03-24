@@ -17,7 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.database import get_db
 from config.redis_client import get_redis
 from config.settings import settings
-from shared.middleware.auth import get_current_user
+from shared.events.outbox import enqueue_event
+from shared.middleware.auth import get_current_user_record
 from shared.models.models import OAuthProvider, RefreshToken, User, UserRole
 from shared.schemas.schemas import AuthCallbackResponse, MessageResponse, TokenResponse, UserResponse
 from shared.utils.security import (
@@ -181,6 +182,25 @@ async def google_callback(
     )
 
     access_token, raw_refresh = await _issue_tokens(user, db, response, request)
+    await enqueue_event(
+        db,
+        topic="user-events",
+        event_type="user.upserted",
+        event_key=str(user.id),
+        payload={
+            "user_id": str(user.id),
+            "email": user.email,
+            "name": user.name,
+            "phone": user.phone,
+            "avatar_url": user.avatar_url,
+            "preferred_language": user.preferred_language,
+            "fcm_token": user.fcm_token,
+            "role": user.role.value,
+            "is_active": user.is_active,
+            "oauth_provider": user.oauth_provider.value,
+            "oauth_id": user.oauth_id,
+        },
+    )
     await db.commit()
 
     return AuthCallbackResponse(
@@ -262,7 +282,7 @@ async def refresh_token(
 @router.post("/logout", response_model=MessageResponse, summary="Logout user")
 async def logout(
     response: Response,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user_record),
     refresh_token_cookie: Optional[str] = Cookie(None, alias="refresh_token"),
     request: Request = None,
     db: AsyncSession = Depends(get_db),
@@ -303,6 +323,6 @@ async def logout(
 
 
 @router.get("/me", response_model=UserResponse, summary="Get current user")
-async def get_me(current_user: User = Depends(get_current_user)):
+async def get_me(current_user: User = Depends(get_current_user_record)):
     """Returns the authenticated user's profile."""
     return UserResponse.model_validate(current_user)

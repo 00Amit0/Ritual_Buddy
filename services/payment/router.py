@@ -15,13 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
 from config.settings import settings
-from shared.middleware.auth import get_current_user, require_admin
+from shared.events.outbox import enqueue_event
+from shared.middleware.auth import (
+    get_current_principal,
+)
 from shared.models.models import (
-    Booking,
-    BookingStatus,
     Payment,
+    PaymentBookingProjection,
     PaymentStatus,
-    User,
+    UserRole,
 )
 from shared.schemas.schemas import (
     MessageResponse,
@@ -30,19 +32,20 @@ from shared.schemas.schemas import (
     PaymentResponse,
     PaymentVerifyRequest,
 )
+from shared.utils.security import verify_razorpay_webhook_signature
+from shared.utils.third_party import get_razorpay_client as build_razorpay_client
 
 router = APIRouter(prefix="/payments", tags=["Payments"])
 
 
 def get_razorpay_client():
-    """Lazy import Razorpay client."""
+    """Lazy Razorpay client with explicit configuration check."""
     try:
-        import razorpay
-        return razorpay.Client(
-            auth=(settings.RAZORPAY_KEY_ID, settings.RAZORPAY_KEY_SECRET)
-        )
+        return build_razorpay_client()
     except ImportError:
         raise HTTPException(status_code=503, detail="Payment service unavailable")
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 # ── Initiate Payment ──────────────────────────────────────────
@@ -50,34 +53,28 @@ def get_razorpay_client():
 @router.post("/initiate", response_model=PaymentInitiateResponse)
 async def initiate_payment(
     data: PaymentInitiateRequest,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """
     Create Razorpay order for a booking.
     Client uses order_id + key_id to open Razorpay checkout.
     """
-    # Fetch booking
-    result = await db.execute(
-        select(Booking).where(
-            Booking.id == data.booking_id,
-            Booking.user_id == current_user.id,
-        )
-    )
-    booking = result.scalar_one_or_none()
+    booking = await db.get(PaymentBookingProjection, data.booking_id)
+    current_user_id = UUID(str(current_user.id))
 
-    if not booking:
+    if not booking or booking.user_id != current_user_id:
         raise HTTPException(status_code=404, detail="Booking not found")
 
-    if booking.status not in (BookingStatus.SLOT_LOCKED, BookingStatus.PAYMENT_PENDING):
+    if booking.status not in ("SLOT_LOCKED", "PAYMENT_PENDING"):
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot initiate payment for booking in '{booking.status.value}' state",
+            detail=f"Cannot initiate payment for booking in '{booking.status}' state",
         )
 
     # Check for existing payment
     existing_payment = await db.execute(
-        select(Payment).where(Payment.booking_id == booking.id)
+        select(Payment).where(Payment.booking_id == booking.booking_id)
     )
     existing = existing_payment.scalar_one_or_none()
     if existing and existing.status == PaymentStatus.CAPTURED:
@@ -91,7 +88,7 @@ async def initiate_payment(
         rzp_order = rzp.order.create({
             "amount": amount_paise,
             "currency": "INR",
-            "receipt": str(booking.id),
+            "receipt": str(booking.booking_id),
             "notes": {
                 "booking_number": booking.booking_number,
                 "user_id": str(current_user.id),
@@ -103,10 +100,11 @@ async def initiate_payment(
     # Create/update Payment record
     if existing:
         existing.razorpay_order_id = rzp_order["id"]
+        payment = existing
     else:
         payment = Payment(
-            booking_id=booking.id,
-            user_id=current_user.id,
+            booking_id=booking.booking_id,
+            user_id=current_user_id,
             razorpay_order_id=rzp_order["id"],
             amount=booking.total_amount,
             platform_fee=booking.platform_fee,
@@ -114,8 +112,21 @@ async def initiate_payment(
         )
         db.add(payment)
 
-    # Update booking status
-    booking.status = BookingStatus.PAYMENT_PENDING
+    await db.flush()
+    await enqueue_event(
+        db,
+        topic="payment-events",
+        event_type="payment.initiated",
+        event_key=str(payment.id),
+        payload={
+            "payment_id": str(payment.id),
+            "booking_id": str(booking.booking_id),
+            "booking_number": booking.booking_number,
+            "user_id": str(booking.user_id),
+            "pandit_id": str(booking.pandit_id),
+            "amount": float(booking.total_amount),
+        },
+    )
     await db.commit()
 
     return PaymentInitiateResponse(
@@ -123,7 +134,7 @@ async def initiate_payment(
         razorpay_key_id=settings.RAZORPAY_KEY_ID,
         amount=amount_paise,
         currency="INR",
-        booking_id=str(booking.id),
+        booking_id=str(booking.booking_id),
     )
 
 
@@ -132,7 +143,7 @@ async def initiate_payment(
 @router.post("/verify", response_model=MessageResponse)
 async def verify_payment(
     data: PaymentVerifyRequest,
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -159,37 +170,35 @@ async def verify_payment(
     payment = payment_result.scalar_one_or_none()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
+    current_user_id = UUID(str(current_user.id))
+    if payment.user_id != current_user_id:
+        raise HTTPException(status_code=403, detail="Not authorized")
 
     payment.razorpay_payment_id = data.razorpay_payment_id
     payment.razorpay_signature = data.razorpay_signature
     payment.status = PaymentStatus.CAPTURED
     payment.captured_at = datetime.now(timezone.utc)
 
-    # Transition booking
-    booking_result = await db.execute(
-        select(Booking).where(Booking.id == data.booking_id)
-    )
-    booking = booking_result.scalar_one_or_none()
+    booking = await db.get(PaymentBookingProjection, data.booking_id)
+
     if booking:
-        booking.status = BookingStatus.AWAITING_PANDIT
-
-        # Notify pandit (in production: via Kafka event)
-        from shared.models.models import Notification, NotificationType, PanditProfile
-        pandit_result = await db.execute(
-            select(PanditProfile).where(PanditProfile.id == booking.pandit_id)
+        await enqueue_event(
+            db,
+            topic="payment-events",
+            event_type="payment.captured",
+            event_key=str(payment.id),
+            payload={
+                "payment_id": str(payment.id),
+                "booking_id": str(booking.booking_id),
+                "booking_number": booking.booking_number,
+                "user_id": str(booking.user_id),
+                "pandit_id": str(booking.pandit_id),
+                "amount": float(payment.amount),
+            },
         )
-        pandit = pandit_result.scalar_one_or_none()
-        if pandit:
-            db.add(Notification(
-                user_id=pandit.user_id,
-                booking_id=booking.id,
-                type=NotificationType.BOOKING_CREATED,
-                title="New Booking Request 🙏",
-                body=f"You have a new paid booking request for {booking.scheduled_at.strftime('%d %b %Y')}. Please accept or decline.",
-            ))
-
     await db.commit()
-    return MessageResponse(message="Payment verified. Pandit has been notified.")
+
+    return MessageResponse(message="Payment verified successfully.")
 
 
 # ── Razorpay Webhook ──────────────────────────────────────────
@@ -204,13 +213,7 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
     signature = request.headers.get("X-Razorpay-Signature", "")
 
     # Validate webhook signature
-    expected = hmac.new(
-        settings.RAZORPAY_WEBHOOK_SECRET.encode(),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
-
-    if not hmac.compare_digest(expected, signature):
+    if not verify_razorpay_webhook_signature(body, signature):
         raise HTTPException(status_code=400, detail="Invalid webhook signature")
 
     import json
@@ -236,19 +239,38 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
             payment.status = PaymentStatus.CAPTURED
             payment.razorpay_payment_id = rzp_payment_id
             payment.captured_at = datetime.now(timezone.utc)
+            booking = await db.get(PaymentBookingProjection, payment.booking_id)
+            if booking:
+                await enqueue_event(
+                    db,
+                    topic="payment-events",
+                    event_type="payment.captured",
+                    event_key=str(payment.id),
+                    payload={
+                        "payment_id": str(payment.id),
+                        "booking_id": str(booking.booking_id),
+                        "booking_number": booking.booking_number,
+                        "user_id": str(booking.user_id),
+                        "pandit_id": str(booking.pandit_id),
+                        "amount": float(payment.amount),
+                    },
+                )
 
     elif event == "payment.failed":
         payment.status = PaymentStatus.FAILED
 
         # Compensating transaction: release slot + cancel booking
-        booking_result = await db.execute(
-            select(Booking).where(Booking.id == payment.booking_id)
+        await enqueue_event(
+            db,
+            topic="payment-events",
+            event_type="payment.failed",
+            event_key=str(payment.id),
+            payload={
+                "payment_id": str(payment.id),
+                "booking_id": str(payment.booking_id),
+                "reason": "Payment failed",
+            },
         )
-        booking = booking_result.scalar_one_or_none()
-        if booking and booking.status == BookingStatus.PAYMENT_PENDING:
-            booking.status = BookingStatus.CANCELLED
-            booking.cancellation_reason = "Payment failed"
-            booking.cancelled_at = datetime.now(timezone.utc)
 
     elif event == "refund.processed":
         refund_entity = payload.get("payload", {}).get("refund", {}).get("entity", {})
@@ -256,6 +278,24 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
         payment.refund_id = refund_entity.get("id")
         payment.refund_amount = float(refund_entity.get("amount", 0)) / 100
         payment.refunded_at = datetime.now(timezone.utc)
+        booking = await db.get(PaymentBookingProjection, payment.booking_id)
+        if booking:
+            await enqueue_event(
+                db,
+                topic="payment-events",
+                event_type="payment.refunded",
+                event_key=str(payment.id),
+                payload={
+                    "payment_id": str(payment.id),
+                    "booking_id": str(booking.booking_id),
+                    "booking_number": booking.booking_number,
+                    "user_id": str(booking.user_id),
+                    "pandit_id": str(booking.pandit_id),
+                    "amount": float(payment.refund_amount or 0),
+                    "refund_id": payment.refund_id,
+                    "reason": "Webhook refund processed",
+                },
+            )
 
     await db.commit()
     return {"status": "ok"}
@@ -267,10 +307,13 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
 async def refund_payment(
     payment_id: UUID,
     amount: float = None,  # None = full refund
-    current_user: User = Depends(require_admin),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Admin-triggered manual refund via Razorpay."""
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=403, detail="Required role: ['ADMIN']")
+
     result = await db.execute(select(Payment).where(Payment.id == payment_id))
     payment = result.scalar_one_or_none()
 
@@ -295,6 +338,24 @@ async def refund_payment(
         payment.refund_id = refund.get("id")
         payment.refund_amount = refund_amount_paise / 100
         payment.refunded_at = datetime.now(timezone.utc)
+        booking = await db.get(PaymentBookingProjection, payment.booking_id)
+        if booking:
+            await enqueue_event(
+                db,
+                topic="payment-events",
+                event_type="payment.refunded",
+                event_key=str(payment.id),
+                payload={
+                    "payment_id": str(payment.id),
+                    "booking_id": str(booking.booking_id),
+                    "booking_number": booking.booking_number,
+                    "user_id": str(booking.user_id),
+                    "pandit_id": str(booking.pandit_id),
+                    "amount": refund_amount_paise / 100,
+                    "refund_id": payment.refund_id,
+                    "reason": "Manual refund",
+                },
+            )
         await db.commit()
 
         return MessageResponse(message=f"Refund of ₹{refund_amount_paise/100} initiated successfully")
@@ -306,15 +367,17 @@ async def refund_payment(
 
 @router.get("/me/history", response_model=list[PaymentResponse])
 async def my_payment_history(
-    current_user: User = Depends(get_current_user),
+    current_user=Depends(get_current_principal),
     db: AsyncSession = Depends(get_db),
 ):
     """Get authenticated user's payment history."""
+    current_user_id = UUID(str(current_user.id))
     result = await db.execute(
         select(Payment)
-        .where(Payment.user_id == current_user.id)
+        .where(Payment.user_id == current_user_id)
         .order_by(Payment.created_at.desc())
         .limit(50)
     )
     payments = result.scalars().all()
     return [PaymentResponse.model_validate(p) for p in payments]
+
