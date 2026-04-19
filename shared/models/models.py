@@ -297,6 +297,10 @@ class PanditProfile(TimestampMixin, Base):
     documents: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     # e.g. {"id_proof": "s3://...", "certificate": "s3://..."}
 
+    # Banking details for payouts
+    bank_account_number: Mapped[Optional[str]] = mapped_column(String(34), nullable=True)
+    bank_ifsc: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+
     is_available: Mapped[bool] = mapped_column(Boolean, default=True)
     profile_complete: Mapped[bool] = mapped_column(Boolean, default=False)
 

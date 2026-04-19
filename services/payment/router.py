@@ -159,6 +159,10 @@ async def verify_payment(
     payment = payment_result.scalar_one_or_none()
     if not payment:
         raise HTTPException(status_code=404, detail="Payment record not found")
+    if str(payment.booking_id) != str(data.booking_id) or str(payment.user_id) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Payment does not belong to this booking")
+    if payment.status == PaymentStatus.CAPTURED:
+        return MessageResponse(message="Payment already verified")
 
     payment.razorpay_payment_id = data.razorpay_payment_id
     payment.razorpay_signature = data.razorpay_signature
@@ -167,26 +171,35 @@ async def verify_payment(
 
     # Transition booking
     booking_result = await db.execute(
-        select(Booking).where(Booking.id == data.booking_id)
+        select(Booking).where(
+            Booking.id == data.booking_id,
+            Booking.user_id == current_user.id,
+        )
     )
     booking = booking_result.scalar_one_or_none()
-    if booking:
-        booking.status = BookingStatus.AWAITING_PANDIT
-
-        # Notify pandit (in production: via Kafka event)
-        from shared.models.models import Notification, NotificationType, PanditProfile
-        pandit_result = await db.execute(
-            select(PanditProfile).where(PanditProfile.id == booking.pandit_id)
+    if not booking:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.status not in (BookingStatus.SLOT_LOCKED, BookingStatus.PAYMENT_PENDING):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot verify payment for booking in '{booking.status.value}' state",
         )
-        pandit = pandit_result.scalar_one_or_none()
-        if pandit:
-            db.add(Notification(
-                user_id=pandit.user_id,
-                booking_id=booking.id,
-                type=NotificationType.BOOKING_CREATED,
-                title="New Booking Request 🙏",
-                body=f"You have a new paid booking request for {booking.scheduled_at.strftime('%d %b %Y')}. Please accept or decline.",
-            ))
+
+    booking.status = BookingStatus.AWAITING_PANDIT
+
+    from shared.models.models import Notification, NotificationType, PanditProfile
+    pandit_result = await db.execute(
+        select(PanditProfile).where(PanditProfile.id == booking.pandit_id)
+    )
+    pandit = pandit_result.scalar_one_or_none()
+    if pandit:
+        db.add(Notification(
+            user_id=pandit.user_id,
+            booking_id=booking.id,
+            type=NotificationType.BOOKING_CREATED,
+            title="New Booking Request 🙏",
+            body=f"You have a new paid booking request for {booking.scheduled_at.strftime('%d %b %Y')}. Please accept or decline.",
+        ))
 
     await db.commit()
     return MessageResponse(message="Payment verified. Pandit has been notified.")
@@ -236,6 +249,12 @@ async def razorpay_webhook(request: Request, db: AsyncSession = Depends(get_db))
             payment.status = PaymentStatus.CAPTURED
             payment.razorpay_payment_id = rzp_payment_id
             payment.captured_at = datetime.now(timezone.utc)
+        booking_result = await db.execute(
+            select(Booking).where(Booking.id == payment.booking_id)
+        )
+        booking = booking_result.scalar_one_or_none()
+        if booking and booking.status in (BookingStatus.SLOT_LOCKED, BookingStatus.PAYMENT_PENDING):
+            booking.status = BookingStatus.AWAITING_PANDIT
 
     elif event == "payment.failed":
         payment.status = PaymentStatus.FAILED

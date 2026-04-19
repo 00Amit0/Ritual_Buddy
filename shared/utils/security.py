@@ -109,7 +109,7 @@ def verify_razorpay_signature(
     import hmac
     body = f"{order_id}|{payment_id}"
     expected = hmac.new(
-        settings.RAZORPAY_WEBHOOK_SECRET.encode(),
+        settings.RAZORPAY_KEY_SECRET.encode(),
         body.encode(),
         hashlib.sha256,
     ).hexdigest()

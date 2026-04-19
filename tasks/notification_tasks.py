@@ -278,7 +278,7 @@ def send_new_booking_request(self, booking_id: str):
 
         db.add(Notification(
             user_id=pandit_user.id,
-            type=NotificationType.BOOKING_REQUEST,
+            type=NotificationType.BOOKING_CREATED,
             title=tmpl["push_title"],
             body=_render(tmpl["push_body"], **vars),
             booking_id=booking.id,
@@ -323,7 +323,7 @@ def send_booking_declined(self, booking_id: str):
 
         db.add(Notification(
             user_id=user.id,
-            type=NotificationType.BOOKING_CANCELLED,
+            type=NotificationType.BOOKING_DECLINED,
             title=tmpl["push_title"],
             body=_render(tmpl["push_body"], **vars),
             booking_id=booking.id,
@@ -385,7 +385,7 @@ def send_booking_reminders():
 
             db.add(Notification(
                 user_id=user.id,
-                type=NotificationType.BOOKING_REMINDER,
+                type=NotificationType.BOOKING_CONFIRMED,
                 title=tmpl["push_title"],
                 body=_render(tmpl["push_body"], **vars),
                 booking_id=booking.id,

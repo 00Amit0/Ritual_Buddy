@@ -40,6 +40,7 @@ from services.notification.router import router as notification_router
 from services.user.router import router as user_router
 from services.review.router import router as review_router
 from services.admin.router import router as admin_router
+from services.search.router import ensure_search_indices, get_es_client
 
 # Resilience patterns
 from pybreaker import CircuitBreaker
@@ -112,6 +113,16 @@ async def lifespan(app: FastAPI):
 
     await init_redis()
     print("✅ Redis connected")
+
+    es_client = await get_es_client()
+    if es_client:
+        try:
+            await ensure_search_indices(es_client)
+            print("✅ Elasticsearch indices ready")
+        except Exception as exc:
+            print(f"⚠️ Elasticsearch init skipped: {exc}")
+        finally:
+            await es_client.close()
 
     # Seed initial data (poojas, etc.) — only in dev
     if settings.APP_ENV == "development":
@@ -259,10 +270,11 @@ Get a token via the `/auth/google` OAuth flow.
     async def global_exception_handler(request: Request, exc: Exception):
         """Catch-all exception handler. Never expose stack traces in production."""
         import traceback
+        from pybreaker import CircuitBreakerError
         
         request_id = getattr(request.state, "request_id", None)
         
-        if isinstance(exc, Exception.__class__):
+        if isinstance(exc, CircuitBreakerError):
             # Circuit breaker is open - service degradation
             logger.error(f"[{request_id}] Service degraded - Circuit breaker open: {str(exc)}")
             return JSONResponse(

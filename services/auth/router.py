@@ -5,6 +5,7 @@ Implements: Login → Callback → JWT issue → Refresh → Logout
 """
 
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlencode
 from typing import Optional
 
 import httpx
@@ -131,6 +132,11 @@ async def _issue_tokens(
     return access_token, raw_refresh
 
 
+def _build_redirect_url(base_url: str, params: dict[str, str]) -> str:
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}{urlencode(params)}"
+
+
 # ── Endpoints ─────────────────────────────────────────────────
 
 @router.get("/google", summary="Initiate Google OAuth2 login")
@@ -160,6 +166,14 @@ async def google_callback(
     try:
         token = await oauth.google.authorize_access_token(request)
     except OAuthError as e:
+        if settings.GOOGLE_AUTH_FAILURE_REDIRECT_URL:
+            return RedirectResponse(
+                url=_build_redirect_url(
+                    settings.GOOGLE_AUTH_FAILURE_REDIRECT_URL,
+                    {"error": e.error},
+                ),
+                status_code=status.HTTP_302_FOUND,
+            )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"OAuth error: {e.error}",
@@ -180,8 +194,24 @@ async def google_callback(
         avatar_url=userinfo.get("picture"),
     )
 
-    access_token, raw_refresh = await _issue_tokens(user, db, response, request)
+    success_redirect = settings.GOOGLE_AUTH_SUCCESS_REDIRECT_URL.strip()
+    if success_redirect:
+        redirect_response = RedirectResponse(url="about:blank", status_code=status.HTTP_302_FOUND)
+        access_token, raw_refresh = await _issue_tokens(user, db, redirect_response, request)
+    else:
+        access_token, raw_refresh = await _issue_tokens(user, db, response, request)
     await db.commit()
+
+    if success_redirect:
+        redirect_response.headers["Location"] = _build_redirect_url(
+            success_redirect,
+            {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "expires_in": str(settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60),
+            },
+        )
+        return redirect_response
 
     return AuthCallbackResponse(
         access_token=access_token,

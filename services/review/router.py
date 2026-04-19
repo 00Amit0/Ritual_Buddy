@@ -10,11 +10,40 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
+from services.search.router import _get_pandit_coordinates, ensure_pandit_index, get_es_client, index_pandit
 from shared.middleware.auth import get_current_user, require_admin
 from shared.models.models import Booking, BookingStatus, PanditProfile, Review, User
 from shared.schemas.schemas import MessageResponse, ReviewCreateRequest, ReviewResponse
 
 router = APIRouter(prefix="/reviews", tags=["Reviews"])
+
+
+async def _sync_pandit_search_index(db: AsyncSession, pandit_id: UUID) -> None:
+    pandit_result = await db.execute(select(PanditProfile).where(PanditProfile.id == pandit_id))
+    pandit = pandit_result.scalar_one_or_none()
+    if not pandit:
+        return
+
+    user_result = await db.execute(select(User).where(User.id == pandit.user_id))
+    user = user_result.scalar_one_or_none()
+    es_client = await get_es_client()
+    if not es_client or not user:
+        return
+
+    try:
+        await ensure_pandit_index(es_client)
+        latitude, longitude = await _get_pandit_coordinates(db, pandit)
+        await index_pandit(
+            es_client,
+            pandit,
+            user,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    except Exception:
+        pass
+    finally:
+        await es_client.close()
 
 
 @router.post("", response_model=ReviewResponse, status_code=status.HTTP_201_CREATED)
@@ -68,8 +97,7 @@ async def create_review(
     )
 
     await db.commit()
-
-    # TODO: Emit ReviewSubmitted Kafka event → Elasticsearch re-index pandit with new rating
+    await _sync_pandit_search_index(db, booking.pandit_id)
 
     return ReviewResponse.model_validate(review)
 
@@ -105,11 +133,15 @@ async def delete_review(
         raise HTTPException(status_code=404, detail="Review not found")
 
     review.is_visible = False
+    await db.flush()
 
     # Recalculate rating excluding hidden review
     avg_result = await db.execute(
         select(func.avg(Review.rating), func.count(Review.id))
-        .where(Review.pandit_id == review.pandit_id, Review.is_visible == True)
+        .where(
+            Review.pandit_id == review.pandit_id,
+            Review.is_visible == True,
+        )
     )
     avg, count = avg_result.one()
     await db.execute(
@@ -119,6 +151,7 @@ async def delete_review(
     )
 
     await db.commit()
+    await _sync_pandit_search_index(db, review.pandit_id)
     return MessageResponse(message="Review hidden successfully")
 
 

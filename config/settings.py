@@ -4,15 +4,16 @@ Application settings loaded from environment variables.
 Uses Pydantic BaseSettings for validation and type safety.
 """
 
+import os
 from functools import lru_cache
 from typing import List, Optional
-from pydantic import field_validator, AnyHttpUrl
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.getenv("ENV_FILE", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -45,6 +46,8 @@ class Settings(BaseSettings):
     GOOGLE_CLIENT_ID: str 
     GOOGLE_CLIENT_SECRET: str 
     GOOGLE_REDIRECT_URI: str = "http://localhost/auth/google/callback"
+    GOOGLE_AUTH_SUCCESS_REDIRECT_URL: str = ""
+    GOOGLE_AUTH_FAILURE_REDIRECT_URL: str = ""
 
     # ── JWT ──────────────────────────────────────────────────
     JWT_SECRET_KEY: str
@@ -63,6 +66,7 @@ class Settings(BaseSettings):
     RAZORPAY_KEY_ID: str = ""
     RAZORPAY_KEY_SECRET: str = ""
     RAZORPAY_WEBHOOK_SECRET: str = ""
+    RAZORPAY_ACCOUNT_NUMBER: str = ""
     PLATFORM_COMMISSION_PERCENT: float = 10.0
 
     # ── Firebase ─────────────────────────────────────────────
@@ -107,6 +111,19 @@ class Settings(BaseSettings):
     # ── Business Config ──────────────────────────────────────
     BOOKING_ACCEPT_DEADLINE_HOURS: int = 2
     PANDIT_NEARBY_DEFAULT_RADIUS_KM: float = 25.0
+
+    @field_validator("DEBUG", mode="before")
+    @classmethod
+    def normalize_debug_flag(cls, value):
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on", "debug", "development"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "release", "prod", "production"}:
+                return False
+        return value
 
     @property
     def allowed_origins_list(self) -> List[str]:

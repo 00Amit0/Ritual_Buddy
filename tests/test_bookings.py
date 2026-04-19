@@ -6,13 +6,14 @@ create → payment → accept/decline → complete/cancel
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from shared.models.models import Booking, BookingStatus, PanditProfile, Pooja, User
+from shared.models.models import Booking, BookingStatus, PanditProfile, Payment, PaymentStatus, Pooja, User
 from tests.conftest import auth_headers
 
 
@@ -273,15 +274,29 @@ async def test_pandit_decline_booking(
         accept_deadline=datetime.now(timezone.utc) + timedelta(hours=2),
     )
     db.add(booking)
+    payment = Payment(
+        id=uuid.uuid4(),
+        booking_id=booking.id,
+        user_id=user.id,
+        razorpay_order_id="order_decline_123",
+        razorpay_payment_id="pay_decline_123",
+        amount=2200,
+        currency="INR",
+        platform_fee=200,
+        status=PaymentStatus.CAPTURED,
+    )
+    db.add(payment)
     await db.commit()
 
-    response = await client.post(
-        f"/bookings/{booking.id}/decline",
-        headers=auth_headers(pandit_user),
-        json={"reason": "Not available due to personal emergency"},
-    )
+    with patch("tasks.payment_tasks.process_refund.apply_async") as mock_apply_async:
+        response = await client.post(
+            f"/bookings/{booking.id}/decline",
+            headers=auth_headers(pandit_user),
+            json={"reason": "Not available due to personal emergency"},
+        )
     assert response.status_code == 200
     assert response.json()["status"] == BookingStatus.DECLINED.value
+    mock_apply_async.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -308,15 +323,78 @@ async def test_user_cancel_booking(
         address={"line1": "1 Road"},
     )
     db.add(booking)
+    payment = Payment(
+        id=uuid.uuid4(),
+        booking_id=booking.id,
+        user_id=user.id,
+        razorpay_order_id="order_cancel_123",
+        razorpay_payment_id="pay_cancel_123",
+        amount=2200,
+        currency="INR",
+        platform_fee=200,
+        status=PaymentStatus.CAPTURED,
+    )
+    db.add(payment)
     await db.commit()
 
-    response = await client.post(
-        f"/bookings/{booking.id}/cancel",
-        headers=auth_headers(user),
-        json={"reason": "Plans changed"},
-    )
+    with patch("tasks.payment_tasks.process_refund.apply_async") as mock_apply_async:
+        response = await client.post(
+            f"/bookings/{booking.id}/cancel",
+            headers=auth_headers(user),
+            json={"reason": "Plans changed"},
+        )
     assert response.status_code == 200
     assert response.json()["status"] == BookingStatus.CANCELLED.value
+    mock_apply_async.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_pandit_complete_booking_enqueues_payout(
+    client: AsyncClient,
+    user: User,
+    pandit_user: User,
+    pandit_profile: PanditProfile,
+    pooja: Pooja,
+    db: AsyncSession,
+):
+    booking = Booking(
+        id=uuid.uuid4(),
+        user_id=user.id,
+        pandit_id=pandit_profile.id,
+        pooja_id=pooja.id,
+        booking_number="PB-2024-DONE",
+        status=BookingStatus.CONFIRMED,
+        scheduled_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        base_amount=2000,
+        platform_fee=200,
+        total_amount=2200,
+        pandit_payout=1800,
+        address={"line1": "1 Road"},
+    )
+    db.add(booking)
+    payment = Payment(
+        id=uuid.uuid4(),
+        booking_id=booking.id,
+        user_id=user.id,
+        razorpay_order_id="order_payout_123",
+        razorpay_payment_id="pay_payout_123",
+        amount=2200,
+        currency="INR",
+        platform_fee=200,
+        status=PaymentStatus.CAPTURED,
+    )
+    db.add(payment)
+    await db.commit()
+
+    with patch("tasks.payment_tasks.process_single_payout.apply_async") as mock_apply_async:
+        response = await client.post(
+            f"/bookings/{booking.id}/complete",
+            headers=auth_headers(pandit_user),
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == BookingStatus.COMPLETED.value
+    mock_apply_async.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -8,6 +8,7 @@ States: DRAFT → SLOT_LOCKED → PAYMENT_PENDING → AWAITING_PANDIT
 import random
 import string
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
@@ -24,6 +25,8 @@ from shared.models.models import (
     BookingStatus,
     PanditAvailability,
     PanditProfile,
+    Payment,
+    PaymentStatus,
     Pooja,
     User,
     UserRole,
@@ -73,7 +76,7 @@ async def _log_status_change(
         to_status=to_status,
         changed_by_id=changed_by.id,
         reason=reason,
-        metadata=metadata,
+        audit_metadata=metadata,
     )
     db.add(log)
 
@@ -85,6 +88,40 @@ def _enrich_booking(booking: Booking) -> BookingResponse:
             for col in Booking.__table__.columns
         }
     )
+
+
+def _time_in_slot(target: dt_time, start_time: str, end_time: str) -> bool:
+    """Return True when the target time falls within the availability slot."""
+    start = datetime.strptime(start_time, "%H:%M:%S").time()
+    end = datetime.strptime(end_time, "%H:%M:%S").time()
+    return start <= target < end
+
+
+async def _find_matching_slot(
+    db: AsyncSession,
+    pandit_id: UUID,
+    scheduled_at: datetime,
+    *,
+    only_unbooked: bool = True,
+) -> PanditAvailability | None:
+    """Find the availability slot that actually covers the booking datetime."""
+    slot_result = await db.execute(
+        select(PanditAvailability).where(
+            PanditAvailability.pandit_id == pandit_id,
+            func.date(PanditAvailability.date) == scheduled_at.date(),
+            PanditAvailability.is_blocked == False,
+        )
+    )
+    slots = slot_result.scalars().all()
+    target_time = scheduled_at.timetz().replace(tzinfo=None)
+
+    for slot in slots:
+        if only_unbooked and slot.is_booked:
+            continue
+        if _time_in_slot(target_time, slot.start_time, slot.end_time):
+            return slot
+
+    return None
 
 
 async def _send_notification_async(
@@ -153,19 +190,16 @@ async def create_booking(
 
     # Step 3: Check availability slot
     scheduled_date = data.scheduled_at.date()
-    slot_result = await db.execute(
-        select(PanditAvailability).where(
-            PanditAvailability.pandit_id == pandit.id,
-            func.date(PanditAvailability.date) == scheduled_date,
-            PanditAvailability.is_booked == False,
-            PanditAvailability.is_blocked == False,
-        )
+    available_slot = await _find_matching_slot(
+        db,
+        pandit.id,
+        data.scheduled_at,
+        only_unbooked=True,
     )
-    available_slot = slot_result.scalars().first()
     if not available_slot:
         raise HTTPException(
             status_code=400,
-            detail="No available slot for the selected date. Please choose another date.",
+            detail="No available slot for the selected time. Please choose another slot.",
         )
 
     # Step 4: Soft-lock slot in Redis
@@ -209,7 +243,14 @@ async def create_booking(
     await cache.lock_slot(str(pandit.id), data.scheduled_at.isoformat(), str(booking.id))
 
     # Audit log
-    await _log_status_change(db, booking, None, BookingStatus.SLOT_LOCKED.value, current_user)
+    await _log_status_change(
+        db,
+        booking,
+        None,
+        BookingStatus.SLOT_LOCKED.value,
+        current_user,
+        metadata={"slot_id": str(available_slot.id)},
+    )
     await db.commit()
 
     return _enrich_booking(booking)
@@ -291,18 +332,21 @@ async def accept_booking(
     booking.status = BookingStatus.CONFIRMED
     booking.confirmed_at = datetime.now(timezone.utc)
 
-    # Mark slot as booked
-    slot_result = await db.execute(
-        select(PanditAvailability).where(
-            PanditAvailability.pandit_id == pandit.id,
-            func.date(PanditAvailability.date) == booking.scheduled_at.date(),
-            PanditAvailability.is_booked == False,
-        )
+    # Mark the exact matched slot as booked
+    slot = await _find_matching_slot(
+        db,
+        pandit.id,
+        booking.scheduled_at,
+        only_unbooked=True,
     )
-    slot = slot_result.scalars().first()
     if slot:
         slot.is_booked = True
         slot.booking_id = booking.id
+    else:
+        raise HTTPException(
+            status_code=409,
+            detail="The booked availability slot could not be found anymore",
+        )
 
     # Release Redis lock (permanent DB booking replaces it)
     cache = RedisCache(redis)
@@ -362,8 +406,10 @@ async def decline_booking(
         db, booking, prev_status, BookingStatus.DECLINED.value, current_user, data.reason
     )
 
-    # Trigger refund via Payment Service (in production: Kafka event)
-    # kafka_producer.send("payment.events", {"type": "REFUND_REQUESTED", "booking_id": str(booking.id)})
+    payment_result = await db.execute(
+        select(Payment).where(Payment.booking_id == booking.id)
+    )
+    payment = payment_result.scalar_one_or_none()
 
     # Notify user
     await _send_notification_async(
@@ -376,6 +422,15 @@ async def decline_booking(
     )
 
     await db.commit()
+
+    if payment and payment.status == PaymentStatus.CAPTURED:
+        from tasks.payment_tasks import process_refund
+
+        process_refund.apply_async(
+            args=[str(payment.id), float(payment.amount), "Pandit declined booking"],
+            queue="payments",
+        )
+
     return _enrich_booking(booking)
 
 
@@ -404,10 +459,24 @@ async def complete_booking(
 
     await _log_status_change(db, booking, prev_status, BookingStatus.COMPLETED.value, current_user)
 
-    # Trigger payout (Kafka: payment.events → payout job)
-    # Trigger review request notification (24hr delay via BullMQ)
+    payment_result = await db.execute(
+        select(Payment).where(
+            Payment.booking_id == booking.id,
+            Payment.status == PaymentStatus.CAPTURED,
+        )
+    )
+    payment = payment_result.scalar_one_or_none()
 
     await db.commit()
+
+    if payment and not payment.payout_id:
+        from tasks.payment_tasks import process_single_payout
+
+        process_single_payout.apply_async(
+            args=[str(payment.id)],
+            queue="payments",
+        )
+
     return _enrich_booking(booking)
 
 
@@ -425,9 +494,16 @@ async def cancel_booking(
     """
     booking = await _get_booking_or_404(booking_id, db)
 
-    # Authorization: user can cancel own booking, admin can cancel any
-    if current_user.role == UserRole.USER and booking.user_id != current_user.id:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    # Authorization: user can cancel own booking, pandit can cancel assigned booking, admin can cancel any
+    if current_user.role == UserRole.USER:
+        if booking.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
+    elif current_user.role == UserRole.PANDIT:
+        pandit = await db.scalar(
+            select(PanditProfile).where(PanditProfile.user_id == current_user.id)
+        )
+        if not pandit or booking.pandit_id != pandit.id:
+            raise HTTPException(status_code=403, detail="Not authorized")
 
     cancellable_statuses = [
         BookingStatus.SLOT_LOCKED,
@@ -469,10 +545,25 @@ async def cancel_booking(
         db, booking, prev_status, BookingStatus.CANCELLED.value, current_user, data.reason
     )
 
-    # Trigger refund
-    # kafka_producer.send("payment.events", {"type": "REFUND_REQUESTED", "booking_id": str(booking.id)})
+    payment_result = await db.execute(
+        select(Payment).where(Payment.booking_id == booking.id)
+    )
+    payment = payment_result.scalar_one_or_none()
 
     await db.commit()
+
+    if payment and payment.status == PaymentStatus.CAPTURED:
+        from tasks.payment_tasks import process_refund
+
+        refund_ratio = 1.0 if booking.scheduled_at - datetime.now(timezone.utc) > timedelta(hours=24) else 0.5
+        refund_amount = round(float(payment.amount) * refund_ratio, 2)
+        reason = "User cancellation with full refund" if refund_ratio == 1.0 else "User cancellation with 50% refund"
+
+        process_refund.apply_async(
+            args=[str(payment.id), refund_amount, reason],
+            queue="payments",
+        )
+
     return _enrich_booking(booking)
 
 

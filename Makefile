@@ -84,6 +84,9 @@ celery-flower: ## Start Flower dashboard for Celery (visit http://localhost:5555
 seed-data: ## Seed initial pooja data
 	python -c "from main import seed_initial_data; import asyncio; asyncio.run(seed_initial_data())"
 
+es-bootstrap: ## Create Elasticsearch indices and backfill pandits + poojas
+	python scripts/bootstrap_elasticsearch.py
+
 health-check: ## Check API health
 	@curl http://localhost:8000/health | jq . 2>/dev/null || echo "❌ API not running"
 

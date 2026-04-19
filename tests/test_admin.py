@@ -5,6 +5,7 @@ Tests for admin-only endpoints: pandit verification, user moderation, analytics,
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -100,16 +101,22 @@ async def test_admin_verify_pandit(
     db.add(pending)
     await db.commit()
 
-    response = await client.post(
-        f"/admin/pandits/{pending.id}/verify",
-        headers=auth_headers(admin_user),
-        json={"notes": "All documents verified. Approved."},
-    )
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.admin.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.admin.router.ensure_pandit_index", new=AsyncMock()), \
+         patch("services.admin.router.index_pandit", new=AsyncMock()) as mock_index:
+        response = await client.post(
+            f"/admin/pandits/{pending.id}/verify",
+            headers=auth_headers(admin_user),
+            json={"notes": "All documents verified. Approved."},
+        )
     assert response.status_code == 200
 
     # Confirm status changed in DB
     await db.refresh(pending)
     assert pending.verification_status == VerificationStatus.VERIFIED
+    mock_index.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -150,16 +157,21 @@ async def test_admin_suspend_pandit(
     db: AsyncSession,
 ):
     """Admin can suspend a verified pandit."""
-    response = await client.post(
-        f"/admin/pandits/{pandit_profile.id}/suspend",
-        headers=auth_headers(admin_user),
-        json={"reason": "Multiple user complaints", "duration_days": 30},
-    )
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.admin.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.admin.router.delete_pandit", new=AsyncMock()) as mock_delete:
+        response = await client.post(
+            f"/admin/pandits/{pandit_profile.id}/suspend",
+            headers=auth_headers(admin_user),
+            json={"reason": "Multiple user complaints", "duration_days": 30},
+        )
     assert response.status_code == 200
 
     await db.refresh(pandit_profile)
     assert pandit_profile.verification_status == VerificationStatus.SUSPENDED
     assert pandit_profile.is_available is False
+    mock_delete.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -334,11 +346,16 @@ async def test_audit_log_is_populated_after_action(
     await db.commit()
 
     # Perform action
-    await client.post(
-        f"/admin/pandits/{pending.id}/verify",
-        headers=auth_headers(admin_user),
-        json={"notes": "Approved"},
-    )
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.admin.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.admin.router.ensure_pandit_index", new=AsyncMock()), \
+         patch("services.admin.router.index_pandit", new=AsyncMock()):
+        await client.post(
+            f"/admin/pandits/{pending.id}/verify",
+            headers=auth_headers(admin_user),
+            json={"notes": "Approved"},
+        )
 
     # Check audit log
     response = await client.get("/admin/audit-logs", headers=auth_headers(admin_user))

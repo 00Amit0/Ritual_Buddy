@@ -72,4 +72,9 @@ config/firebase-credentials.json
 .cache/
 tmp/
 temp/
-*.tmp
+*.tmp.env.production
+oauth_cookie.txt
+alembic.ini
+.env.production
+oauth_cookie.txt
+alembic.ini

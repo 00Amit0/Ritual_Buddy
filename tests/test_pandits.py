@@ -5,6 +5,7 @@ Tests for pandit profile management, availability, and public profile visibility
 
 import uuid
 from datetime import date, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -55,19 +56,25 @@ async def test_nonexistent_pandit_returns_404(client: AsyncClient):
 async def test_pandit_can_update_own_profile(
     client: AsyncClient, pandit_user: User, pandit_profile: PanditProfile
 ):
-    response = await client.put(
-        "/pandits/me/profile",
-        headers=auth_headers(pandit_user),
-        json={
-            "bio": "Updated bio with more details about my practice.",
-            "experience_years": 12,
-            "city": "Prayagraj",
-        },
-    )
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.pandit.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.pandit.router.ensure_pandit_index", new=AsyncMock()), \
+         patch("services.pandit.router.index_pandit", new=AsyncMock()) as mock_index:
+        response = await client.put(
+            "/pandits/me/profile",
+            headers=auth_headers(pandit_user),
+            json={
+                "bio": "Updated bio with more details about my practice.",
+                "experience_years": 12,
+                "city": "Prayagraj",
+            },
+        )
     assert response.status_code == 200
     data = response.json()
     assert data["bio"] == "Updated bio with more details about my practice."
     assert data["experience_years"] == 12
+    mock_index.assert_awaited_once()
 
 
 @pytest.mark.asyncio

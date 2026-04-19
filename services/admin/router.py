@@ -15,6 +15,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
+from services.search.router import (
+    _get_pandit_coordinates,
+    delete_pandit,
+    ensure_pandit_index,
+    get_es_client,
+    index_pandit,
+)
 from shared.middleware.auth import require_admin
 from shared.models.models import (
     AdminAuditLog,
@@ -62,6 +69,53 @@ async def _log(
         ip_address=request.client.host if request and request.client else None,
     )
     db.add(log)
+
+
+async def _sync_pandit_search(db: AsyncSession, pandit: PanditProfile) -> None:
+    user_result = await db.execute(select(User).where(User.id == pandit.user_id))
+    pandit_user = user_result.scalar_one_or_none()
+    es_client = await get_es_client()
+
+    if not es_client or not pandit_user:
+        return
+
+    try:
+        await ensure_pandit_index(es_client)
+        latitude, longitude = await _get_pandit_coordinates(db, pandit)
+        await index_pandit(
+            es_client,
+            pandit,
+            pandit_user,
+            latitude=latitude,
+            longitude=longitude,
+        )
+    except Exception:
+        pass
+    finally:
+        await es_client.close()
+
+
+async def _remove_pandit_search(pandit_id: UUID) -> None:
+    es_client = await get_es_client()
+    if not es_client:
+        return
+
+    try:
+        await delete_pandit(es_client, pandit_id)
+    except Exception:
+        pass
+    finally:
+        await es_client.close()
+
+
+async def _notify_pandit(db: AsyncSession, pandit: PanditProfile, title: str, body: str) -> None:
+    """Create an in-app notification for the pandit."""
+    db.add(Notification(
+        user_id=pandit.user_id,
+        type=NotificationType.ACCOUNT_VERIFIED,
+        title=title,
+        body=body,
+    ))
 
 
 # ── Pandit Verification Queue ──────────────────────────────────────────────────
@@ -126,7 +180,7 @@ async def verify_pandit(
     - Sets status to VERIFIED
     - Makes them visible in search results
     - Sends in-app + push notification to the pandit
-    - TODO: Emit Kafka event → Elasticsearch index
+    - Syncs the search index
     """
     result = await db.execute(select(PanditProfile).where(PanditProfile.id == pandit_id))
     pandit = result.scalar_one_or_none()
@@ -139,20 +193,17 @@ async def verify_pandit(
     pandit.verification_notes = data.notes
     pandit.verified_at = datetime.now(timezone.utc)
     pandit.verified_by_id = current_user.id
-
-    # In-app notification
-    db.add(Notification(
-        user_id=pandit.user_id,
-        type=NotificationType.ACCOUNT_VERIFIED,
-        title="Profile Verified! 🎉",
-        body="Congratulations! Your pandit profile has been verified. You can now accept bookings.",
-    ))
+    await _notify_pandit(
+        db,
+        pandit,
+        "Profile Verified! 🎉",
+        "Congratulations! Your pandit profile has been verified. You can now accept bookings.",
+    )
 
     await _log(db, current_user, "VERIFY_PANDIT", "PanditProfile", str(pandit_id),
                {"notes": data.notes}, request)
 
-    # TODO: emit PanditVerified Kafka event
-    # kafka.produce("pandit.verified", {"pandit_id": str(pandit_id)})
+    await _sync_pandit_search(db, pandit)
 
     await db.commit()
     return MessageResponse(message="Pandit verified successfully")
@@ -174,13 +225,12 @@ async def reject_pandit(
 
     pandit.verification_status = VerificationStatus.REJECTED
     pandit.verification_notes = data.reason
-
-    db.add(Notification(
-        user_id=pandit.user_id,
-        type=NotificationType.ACCOUNT_VERIFIED,  # reuse; add ACCOUNT_REJECTED type in prod
-        title="Application Update",
-        body=f"Your pandit profile application was not approved. Reason: {data.reason}",
-    ))
+    await _notify_pandit(
+        db,
+        pandit,
+        "Application Update",
+        f"Your pandit profile application was not approved. Reason: {data.reason}",
+    )
 
     await _log(db, current_user, "REJECT_PANDIT", "PanditProfile", str(pandit_id),
                {"reason": data.reason}, request)
@@ -205,11 +255,17 @@ async def suspend_pandit(
     pandit.verification_status = VerificationStatus.SUSPENDED
     pandit.is_available = False
     pandit.verification_notes = f"SUSPENDED: {data.reason}"
+    await _notify_pandit(
+        db,
+        pandit,
+        "Profile Suspended",
+        f"Your pandit profile has been suspended. Reason: {data.reason}",
+    )
 
     await _log(db, current_user, "SUSPEND_PANDIT", "PanditProfile", str(pandit_id),
                {"reason": data.reason, "duration_days": data.duration_days}, request)
 
-    # TODO: emit PanditSuspended Kafka event → remove from Elasticsearch
+    await _remove_pandit_search(pandit_id)
     await db.commit()
     return MessageResponse(message="Pandit suspended")
 
@@ -232,8 +288,15 @@ async def reinstate_pandit(
     pandit.verification_status = VerificationStatus.VERIFIED
     pandit.is_available = True
     pandit.verification_notes = None
+    await _notify_pandit(
+        db,
+        pandit,
+        "Profile Reinstated",
+        "Your pandit profile has been reinstated and is visible for new bookings again.",
+    )
 
     await _log(db, current_user, "REINSTATE_PANDIT", "PanditProfile", str(pandit_id), {}, request)
+    await _sync_pandit_search(db, pandit)
     await db.commit()
     return MessageResponse(message="Pandit reinstated")
 
@@ -259,6 +322,10 @@ async def suspend_user(
         raise HTTPException(status_code=409, detail="User is already suspended")
 
     user.is_active = False
+    if user.role == UserRole.PANDIT:
+        pandit = await db.scalar(select(PanditProfile).where(PanditProfile.user_id == user.id))
+        if pandit:
+            pandit.is_available = False
     await _log(db, current_user, "SUSPEND_USER", "User", str(user_id),
                {"reason": data.reason}, request)
     await db.commit()
@@ -278,7 +345,14 @@ async def reactivate_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
+    if user.is_active:
+        raise HTTPException(status_code=409, detail="User is already active")
+
     user.is_active = True
+    if user.role == UserRole.PANDIT:
+        pandit = await db.scalar(select(PanditProfile).where(PanditProfile.user_id == user.id))
+        if pandit and pandit.verification_status == VerificationStatus.VERIFIED:
+            pandit.is_available = True
     await _log(db, current_user, "REACTIVATE_USER", "User", str(user_id), {}, request)
     await db.commit()
     return MessageResponse(message="User reactivated")
@@ -413,9 +487,7 @@ async def get_audit_logs(
     if entity_type:
         query = query.where(AdminAuditLog.entity_type == entity_type)
 
-    total = await db.scalar(select(func.count()).select_from(
-        select(AdminAuditLog).subquery()
-    ))
+    total = await db.scalar(select(func.count()).select_from(query.subquery()))
     result = await db.execute(query.offset((page - 1) * page_size).limit(page_size))
     rows = result.all()
 

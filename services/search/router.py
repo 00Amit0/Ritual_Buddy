@@ -5,6 +5,7 @@ full-text on name/bio, sorting by distance/rating/price.
 Falls back to PostgreSQL PostGIS if Elasticsearch unavailable.
 """
 
+import json
 from typing import List, Optional
 from uuid import UUID
 
@@ -71,6 +72,33 @@ PANDIT_INDEX_MAPPING = {
     },
 }
 
+POOJA_INDEX_MAPPING = {
+    "mappings": {
+        "properties": {
+            "id": {"type": "keyword"},
+            "name_en": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword"}},
+            },
+            "name_hi": {
+                "type": "text",
+                "fields": {"keyword": {"type": "keyword"}},
+            },
+            "slug": {"type": "keyword"},
+            "category": {"type": "keyword"},
+            "description_en": {"type": "text"},
+            "description_hi": {"type": "text"},
+            "avg_duration_hrs": {"type": "float"},
+            "image_url": {"type": "keyword", "index": False},
+            "is_active": {"type": "boolean"},
+        }
+    },
+    "settings": {
+        "number_of_shards": 1,
+        "number_of_replicas": 1,
+    },
+}
+
 
 async def ensure_pandit_index(es_client) -> None:
     """Create Elasticsearch index if it doesn't exist."""
@@ -82,7 +110,45 @@ async def ensure_pandit_index(es_client) -> None:
         )
 
 
-async def index_pandit(es_client, pandit: PanditProfile, user: User) -> None:
+async def ensure_pooja_index(es_client) -> None:
+    """Create pooja index if it doesn't exist."""
+    exists = await es_client.indices.exists(index=settings.ELASTICSEARCH_INDEX_POOJAS)
+    if not exists:
+        await es_client.indices.create(
+            index=settings.ELASTICSEARCH_INDEX_POOJAS,
+            body=POOJA_INDEX_MAPPING,
+        )
+
+
+async def ensure_search_indices(es_client) -> None:
+    """Create all Elasticsearch indices required by the app."""
+    await ensure_pandit_index(es_client)
+    await ensure_pooja_index(es_client)
+
+
+async def _get_pandit_coordinates(db: AsyncSession, pandit: PanditProfile) -> tuple[Optional[float], Optional[float]]:
+    if pandit.location is None:
+        return None, None
+
+    geo_json = await db.scalar(select(func.ST_AsGeoJSON(pandit.location)))
+    if not geo_json:
+        return None, None
+
+    coordinates = json.loads(geo_json).get("coordinates", [])
+    if len(coordinates) != 2:
+        return None, None
+
+    longitude, latitude = coordinates
+    return latitude, longitude
+
+
+async def index_pandit(
+    es_client,
+    pandit: PanditProfile,
+    user: User,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+) -> None:
     """Index or update a pandit document in Elasticsearch."""
     doc = {
         "id": str(pandit.id),
@@ -103,17 +169,105 @@ async def index_pandit(es_client, pandit: PanditProfile, user: User) -> None:
         "avatar_url": user.avatar_url,
     }
 
-    # Add location if available
-    # Note: pandit.location is a PostGIS WKB — extract lat/lng
-    # In production this would come from the event payload
-    if pandit.city:  # Simplified; real impl extracts from PostGIS
-        doc["location"] = {"lat": 28.6, "lon": 77.2}  # Placeholder
+    if latitude is not None and longitude is not None:
+        doc["location"] = {"lat": latitude, "lon": longitude}
 
     await es_client.index(
         index=settings.ELASTICSEARCH_INDEX_PANDITS,
         id=str(pandit.id),
         body=doc,
     )
+
+
+async def delete_pandit(es_client, pandit_id: UUID) -> None:
+    """Remove a pandit document from Elasticsearch if it exists."""
+    await es_client.delete(
+        index=settings.ELASTICSEARCH_INDEX_PANDITS,
+        id=str(pandit_id),
+    )
+
+
+async def index_pooja(es_client, pooja: Pooja) -> None:
+    """Index or update a pooja document in Elasticsearch."""
+    await es_client.index(
+        index=settings.ELASTICSEARCH_INDEX_POOJAS,
+        id=str(pooja.id),
+        body={
+            "id": str(pooja.id),
+            "name_en": pooja.name_en,
+            "name_hi": pooja.name_hi,
+            "slug": pooja.slug,
+            "category": pooja.category.value,
+            "description_en": pooja.description_en or "",
+            "description_hi": pooja.description_hi or "",
+            "avg_duration_hrs": float(pooja.avg_duration_hrs),
+            "image_url": pooja.image_url,
+            "is_active": pooja.is_active,
+        },
+    )
+
+
+async def delete_pooja(es_client, pooja_id: UUID) -> None:
+    """Remove a pooja document from Elasticsearch if it exists."""
+    try:
+        await es_client.delete(
+            index=settings.ELASTICSEARCH_INDEX_POOJAS,
+            id=str(pooja_id),
+        )
+    except Exception:
+        pass
+
+
+async def sync_all_pandits_to_index(db: AsyncSession, es_client) -> int:
+    """Backfill all verified pandits into Elasticsearch."""
+    result = await db.execute(
+        select(PanditProfile, User)
+        .join(User, User.id == PanditProfile.user_id)
+        .where(PanditProfile.verification_status == VerificationStatus.VERIFIED)
+    )
+    rows = result.all()
+
+    count = 0
+    for pandit, user in rows:
+        latitude, longitude = await _get_pandit_coordinates(db, pandit)
+        await index_pandit(
+            es_client,
+            pandit,
+            user,
+            latitude=latitude,
+            longitude=longitude,
+        )
+        count += 1
+
+    await es_client.indices.refresh(index=settings.ELASTICSEARCH_INDEX_PANDITS)
+    return count
+
+
+async def sync_all_poojas_to_index(db: AsyncSession, es_client) -> int:
+    """Backfill all active poojas into Elasticsearch."""
+    result = await db.execute(select(Pooja).where(Pooja.is_active == True))
+    poojas = result.scalars().all()
+
+    count = 0
+    for pooja in poojas:
+        await index_pooja(es_client, pooja)
+        count += 1
+
+    await es_client.indices.refresh(index=settings.ELASTICSEARCH_INDEX_POOJAS)
+    return count
+
+
+async def bootstrap_search_indices(db: AsyncSession, es_client) -> dict:
+    """Create required indices and backfill current DB state."""
+    await ensure_search_indices(es_client)
+    pandits_indexed = await sync_all_pandits_to_index(db, es_client)
+    poojas_indexed = await sync_all_poojas_to_index(db, es_client)
+    return {
+        "pandits_indexed": pandits_indexed,
+        "poojas_indexed": poojas_indexed,
+        "pandit_index": settings.ELASTICSEARCH_INDEX_PANDITS,
+        "pooja_index": settings.ELASTICSEARCH_INDEX_POOJAS,
+    }
 
 
 # ── Main Search Endpoints ─────────────────────────────────────
@@ -411,6 +565,43 @@ async def search_poojas(
     db: AsyncSession = Depends(get_db),
 ):
     """Search available pooja types. Cached results."""
+    es_client = await get_es_client()
+    if es_client:
+        try:
+            must_clauses = []
+            filters = [{"term": {"is_active": True}}]
+
+            if q:
+                must_clauses.append({
+                    "multi_match": {
+                        "query": q,
+                        "fields": ["name_en^3", "name_hi^3", "slug^2", "description_en", "description_hi"],
+                        "fuzziness": "AUTO",
+                    }
+                })
+            if category:
+                filters.append({"term": {"category": category}})
+
+            response = await es_client.search(
+                index=settings.ELASTICSEARCH_INDEX_POOJAS,
+                body={
+                    "query": {
+                        "bool": {
+                            "must": must_clauses or [{"match_all": {}}],
+                            "filter": filters,
+                        }
+                    },
+                    "sort": [{"name_en.keyword": {"order": "asc"}}],
+                    "size": 100,
+                },
+            )
+
+            return [hit["_source"] for hit in response["hits"]["hits"]]
+        except Exception:
+            pass
+        finally:
+            await es_client.close()
+
     query = select(Pooja).where(Pooja.is_active == True)
 
     if q:

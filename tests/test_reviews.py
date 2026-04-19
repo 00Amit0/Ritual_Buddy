@@ -5,6 +5,7 @@ Tests for review creation, rating validation, flagging, and admin moderation.
 
 import uuid
 from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -45,19 +46,25 @@ async def test_create_review_success(
     db.add(booking)
     await db.commit()
 
-    response = await client.post(
-        "/reviews",
-        headers=auth_headers(user),
-        json={
-            "booking_id": str(booking.id),
-            "rating": 5,
-            "comment": "Excellent service, very knowledgeable pandit!",
-        },
-    )
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.review.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.review.router.ensure_pandit_index", new=AsyncMock()), \
+         patch("services.review.router.index_pandit", new=AsyncMock()) as mock_index:
+        response = await client.post(
+            "/reviews",
+            headers=auth_headers(user),
+            json={
+                "booking_id": str(booking.id),
+                "rating": 5,
+                "comment": "Excellent service, very knowledgeable pandit!",
+            },
+        )
     assert response.status_code == 201
     data = response.json()
     assert data["rating"] == 5
     assert data["comment"] == "Excellent service, very knowledgeable pandit!"
+    mock_index.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -191,18 +198,24 @@ async def test_admin_delete_review(
     db.add(booking)
     await db.commit()
 
-    r = await client.post(
-        "/reviews",
-        headers=auth_headers(user),
-        json={"booking_id": str(booking.id), "rating": 1, "comment": "Bad review to delete"},
-    )
-    review_id = r.json()["id"]
+    mock_es = MagicMock()
+    mock_es.close = AsyncMock()
+    with patch("services.review.router.get_es_client", new=AsyncMock(return_value=mock_es)), \
+         patch("services.review.router.ensure_pandit_index", new=AsyncMock()), \
+         patch("services.review.router.index_pandit", new=AsyncMock()) as mock_index:
+        r = await client.post(
+            "/reviews",
+            headers=auth_headers(user),
+            json={"booking_id": str(booking.id), "rating": 1, "comment": "Bad review to delete"},
+        )
+        review_id = r.json()["id"]
 
-    delete_response = await client.delete(
-        f"/reviews/{review_id}",
-        headers=auth_headers(admin_user),
-    )
+        delete_response = await client.delete(
+            f"/reviews/{review_id}",
+            headers=auth_headers(admin_user),
+        )
     assert delete_response.status_code == 200
+    assert mock_index.await_count >= 2
 
 
 @pytest.mark.asyncio

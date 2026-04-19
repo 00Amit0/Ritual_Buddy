@@ -292,7 +292,7 @@ def release_expired_slot_locks():
                 from_status=prev_status,
                 to_status=BookingStatus.CANCELLED,
                 reason="Payment window expired — auto-cancelled by system",
-                metadata={"cancelled_by": "system", "task": "release_expired_slot_locks"},
+                audit_metadata={"cancelled_by": "system", "task": "release_expired_slot_locks"},
             ))
 
             # Release Redis slot lock (belt+suspenders — TTL should have expired it already)

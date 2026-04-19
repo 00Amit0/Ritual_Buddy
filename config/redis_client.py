@@ -112,10 +112,11 @@ class RedisCache:
         count: int = 50,
     ) -> list[dict]:
         """Get pandit IDs within radius_km of given coordinates."""
-        results = await self.client.georadiusbymember(
+        results = await self.client.geosearch(
             "pandits_geo",
-            lng, lat,
-            radius_km,
+            longitude=lng,
+            latitude=lat,
+            radius=radius_km,
             unit="km",
             withcoord=True,
             withdist=True,

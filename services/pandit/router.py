@@ -15,6 +15,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from config.database import get_db
 from config.redis_client import RedisCache, get_redis
+from services.search.router import (
+    _get_pandit_coordinates,
+    delete_pandit,
+    ensure_pandit_index,
+    get_es_client,
+    index_pandit,
+)
 from shared.middleware.auth import get_current_user, require_pandit
 from shared.models.models import (
     Booking,
@@ -75,6 +82,34 @@ async def _enrich_profile(pandit: PanditProfile, db: AsyncSession) -> PanditProf
         name=user.name if user else None,
         avatar_url=user.avatar_url if user else None,
     )
+
+
+async def _sync_pandit_search_index(
+    pandit: PanditProfile,
+    user: User,
+    db: AsyncSession,
+) -> None:
+    es_client = await get_es_client()
+    if not es_client:
+        return
+
+    try:
+        if pandit.verification_status == VerificationStatus.VERIFIED:
+            await ensure_pandit_index(es_client)
+            latitude, longitude = await _get_pandit_coordinates(db, pandit)
+            await index_pandit(
+                es_client,
+                pandit,
+                user,
+                latitude=latitude,
+                longitude=longitude,
+            )
+        else:
+            await delete_pandit(es_client, pandit.id)
+    except Exception:
+        pass
+    finally:
+        await es_client.close()
 
 
 # ── Public Endpoints ──────────────────────────────────────────
@@ -201,6 +236,7 @@ async def update_my_profile(
         # Auto-create profile on first update
         pandit = PanditProfile(user_id=current_user.id)
         db.add(pandit)
+        await db.flush()
 
     # Apply updates
     for field, value in update_data.model_dump(exclude_none=True, exclude={"latitude", "longitude"}).items():
@@ -220,7 +256,7 @@ async def update_my_profile(
     # Check if profile is complete
     pandit.profile_complete = all([
         pandit.bio,
-        pandit.experience_years >= 0,
+        pandit.experience_years > 0,
         pandit.languages,
         pandit.poojas_offered,
         pandit.city,
@@ -233,8 +269,7 @@ async def update_my_profile(
     cache = RedisCache(redis)
     await cache.delete(f"pandit:{pandit.id}")
 
-    # TODO: Emit PanditUpdated event to Kafka → Elasticsearch re-index
-    # await kafka_producer.send("pandit.updates", {...})
+    await _sync_pandit_search_index(pandit, current_user, db)
 
     profile = await _enrich_profile(pandit, db)
     return profile
@@ -394,9 +429,14 @@ async def get_my_earnings(
 
     # Pending (completed bookings, not yet paid out)
     pending_result = await db.execute(
-        select(func.sum(Booking.pandit_payout)).where(
+        select(func.sum(Booking.pandit_payout))
+        .select_from(Booking)
+        .outerjoin(Payment, Payment.booking_id == Booking.id)
+        .where(
             Booking.pandit_id == pandit.id,
             Booking.status == BookingStatus.COMPLETED,
+            ((Payment.id == None) | (Payment.payout_id == None)),
+            ((Payment.id == None) | (Payment.status == PaymentStatus.CAPTURED)),
         )
     )
     pending_payout = pending_result.scalar() or 0
